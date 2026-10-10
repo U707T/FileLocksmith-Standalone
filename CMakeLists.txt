@@ -34,6 +34,10 @@ target_include_directories(FileLocksmith PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}
 target_link_libraries(FileLocksmith PRIVATE kernel32 user32 gdi32 shell32 advapi32 comctl32 psapi)
 
 if (MSVC)
+    # Static CRT (/MT): the shipped exe must not need the VC++ redistributable.
+    # The MinGW build is already static (-static), so both artifacts are
+    # self-contained single files.
+    set_property(TARGET FileLocksmith PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     # /utf-8 is required: the UI strings in cli.cpp / gui.cpp are UTF-8.
     target_compile_options(FileLocksmith PRIVATE /utf-8 /W3 /permissive-)
     # Keep the Windows subsystem (no console flash on double click) but use the

@@ -118,7 +118,9 @@ cmake --build build --config Release
 关键点（都已在 `CMakeLists.txt` 里配好）：
 - `/utf-8`：`cli.cpp` / `gui.cpp` 里的中文界面字符串是 UTF-8 编码，不加这个 MSVC 会按 GBK 解析；
 - `UNICODE` + `_UNICODE`：否则 `ListView_SetItemText` 这类宏会展开成 ANSI 版本；
-- `/ENTRY:mainCRTStartup` + `WIN32` 子系统：既能当 GUI 用（双击不闪控制台），又能当 CLI 用。
+- `/ENTRY:mainCRTStartup` + `WIN32` 子系统：既能当 GUI 用（双击不闪控制台），又能当 CLI 用；
+- `/MT` + `/MANIFEST:NO`：静态链接 CRT（不依赖 VC++ 运行时），并关掉链接器自动生成的
+  manifest（我们在 `res/resource.rc` 里已经嵌了完整的一份，否则 CVTRES 会报重复资源）。
 
 ### Linux 交叉编译（本仓库就是这么产出 `dist/` 里那个 exe 的）
 ```bash
@@ -150,7 +152,7 @@ cmake --build build -j
 | | 原版模块 | 本独立版 |
 | --- | --- | --- |
 | 界面框架 | WinUI 3 / Windows App SDK（按官方配置是 **self-contained** 部署，运行时几十 MB 起） | Win32 原生控件（系统自带） |
-| 运行依赖 | Windows App SDK 运行时、VC++ 运行时、MSIX 外壳扩展 | 仅系统 DLL（kernel32/user32/shell32/advapi32/comctl32） |
+| 运行依赖 | Windows App SDK 运行时、VC++ 运行时、MSIX 外壳扩展 | 仅系统 DLL（kernel32/user32/shell32/advapi32/comctl32），不需要 VC++ 运行时 |
 | 分发 | 安装包 + 签名 + 注册外壳扩展 | 单个 exe，拷走就能用 |
 | 进程间通信 | 命名管道/临时文件 + 两个进程 | 单实例 + `WM_COPYDATA` |
 
@@ -166,8 +168,10 @@ cmake --build build -j
    GUI 里这个工作放在后台线程，不会卡界面。
 4. **结束进程 = `TerminateProcess`**：没有"保存数据"的优雅退出，界面上有二次确认。
 5. **不做持久化**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
-6. **未做运行时验证**：本独立版在 Linux 沙箱里只能做到"编译通过 + PE/资源/字符串静态校验"，
-   无法在 Windows 上实跑。核心算法逐行取自 PowerToys 正式代码，但首次在真机运行前请自行验证。
+6. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
+   放在冒烟测试里 —— CI 的 `windows-2022` job 会真的创建一个被独占占用的文件，
+   断言 exe 能报出占用者的 PID 与用户名，再用 `--kill` 断言占用进程确实被结束。
+   这部分逻辑本身没在 Windows 上手点过（GUI 窗口的交互尤其没有），有问题请提 issue。
 
 ---
 

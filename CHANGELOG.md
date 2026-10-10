@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1 (2026-10-10)
+
+### 修复
+- MSVC 构建改为静态链接 C 运行时（`/MT`）。1.0.0 的 `FileLocksmith-x64.exe` 依赖
+  `MSVCP140.dll` / `VCRUNTIME140.dll`（需要装 VC++ 2015-2022 运行时），
+  现在两个产物都只依赖系统 DLL。
+- CI 的功能自测改用 `Start-Process` 捕获输出：PowerShell 7 会把 Windows 子系统的
+  exe 当图形程序，`& exe args` 不等待也不捕获输出。
+
+### 说明
+- 1.0.0 的 release 保留，作为首次通过 CI 端到端验证的版本。
+
 ## 1.0.0 (2026-10-10)
 
 首个版本：把 PowerToys 的 **FileLocksmith**（"什么正在占用这个文件？"）抽成一个不依赖
