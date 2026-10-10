@@ -320,6 +320,12 @@ int cli_main(const std::vector<std::wstring>& args)
         {
             new_args.push_back(L"--gui");
         }
+        else
+        {
+            // 提权后的进程拿不到原来的控制台：补 --cli 让它自己开一个窗口回显结果，
+            // 否则会退化成打开图形界面，和用户在命令行里的预期不符。
+            new_args.push_back(L"--cli");
+        }
         return app::relaunch_elevated(new_args) ? 0 : 1;
     }
 

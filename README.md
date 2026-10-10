@@ -305,7 +305,57 @@ git add -A && git commit -m "chore: 发布 1.1.0" && git push origin main
 
 tag 已存在时 `release` job 只编译不重发，避免重复发布。
 
-## 12. 许可
+## 12. 怎么测试
+
+### 一键自测（与 CI 同一套用例）
+
+```powershell
+# 解压后，在含 exe 的目录里：
+pwsh -File tools\run-local-tests.ps1 -Exe .\FileLocksmith-x64.exe
+# Windows PowerShell 5.1 也行：
+powershell -ExecutionPolicy Bypass -File tools\run-local-tests.ps1
+```
+
+脚本会自己造"被独占占用的文件"、起测试进程、跑 8 个用例，最后打印通过/失败数；
+全部通过退出码 0，有失败退出码 1。它只动自己起的测试进程和 `%TEMP%\fl-local-test`，
+右键菜单与「发送到」快捷方式是**临时注册后立刻清理**。
+
+> ⚠️ 别用管理员权限跑这个脚本：一是没必要，二是提权后 CI 里那些基于 UIPI 的边界行为会变样。
+> 想专门测提权路径，手工跑 `FileLocksmith-x64.exe --elevate <文件>`。
+
+### 手工验证清单
+
+命令行（cmd，`FileLocksmith-x64.exe` 换成你的路径）：
+
+| 步骤 | 命令 | 期望 |
+| --- | --- | --- |
+| 造一个被占用的文件 | `powershell -NoProfile -Command "$f=[IO.File]::Open('D:\test\locked.txt','Open','ReadWrite','None'); Read-Host '占用中，按回车释放'"` | 窗口挂着不关 |
+| 检出占用者 | `FileLocksmith-x64.exe D:\test\locked.txt` | 表格里出现那个 powershell 的 PID |
+| 结束占用者 | `FileLocksmith-x64.exe D:\test\locked.txt --kill` | 打印"已结束进程 …"，占用窗口消失 |
+| 强制解锁 | 重新造占用后 `FileLocksmith-x64.exe D:\test\locked.txt --unlock` | 打印"已强制关闭 1/1 个文件句柄"，**占用窗口还活着**，文件能打开了 |
+| 等待解锁 | `FileLocksmith-x64.exe D:\test\locked.txt --wait --timeout 30000` | 你在另一个窗口按回车释放后，它打印"文件已解锁"；不释放则 30 秒后超时 |
+| 无效路径 | `FileLocksmith-x64.exe D:\nope.txt` | 警告 + "没有任何路径被成功检查"（不能说"没有占用"） |
+| 脚本友好 | `FileLocksmith-x64.exe D:\test\locked.txt --json \| ConvertFrom-Json` | 能解析成功，说明 stdout 里只有 JSON |
+| 提权 | `FileLocksmith-x64.exe --elevate D:\test\locked.txt` | UAC → 新控制台窗口，且"管理员权限: 是" |
+
+图形界面：
+
+- 双击 exe → 把文件**拖到列表区域**（重点：1.2.1 之前这里没反应）、拖到按钮上、拖到状态栏上都要能接；
+- 拖到 **exe 图标 / 快捷方式**上：已有窗口的话应该合并到同一个窗口，没开的话新开一个；
+- 「文件 → 添加文件…（Ctrl+O）/ 添加文件夹…」能选多选文件；
+- 「文件 → 添加到资源管理器右键菜单」勾上后，去资源管理器右键验证（Win10 在一级菜单，Win11 在"显示更多选项"）；
+- 选中进程 → `结束进程` / `强制解锁`（后者会弹风险确认）；
+- 「帮助 → 关于」能看到系统版本、是否管理员、两个集成的状态；
+- 有第二块屏且缩放比不同的话，把窗口拖过去，字体和布局应该跟着变（1.2.1 修复）。
+
+### 反馈问题时请带上
+
+1. `FileLocksmith-x64.exe --version` 的完整输出（含系统版本与是否管理员）；
+2. 你执行的完整命令 / 在界面上点的按钮；
+3. 看到的现象（报错文字、截图）；
+4. 如果是一键脚本失败，直接把脚本输出的**全部内容**贴出来。
+
+## 13. 许可
 
 衍生自 Microsoft PowerToys（MIT License，Copyright (c) Microsoft Corporation），
 完整许可证见 `LICENSE-PowerToys-MIT.txt`。保留原版权声明即可自由用于商业/非商业项目。
