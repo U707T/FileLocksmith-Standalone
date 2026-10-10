@@ -199,7 +199,7 @@ namespace gui::detail
             return;
         }
 
-        const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
+        const bool lock_like = is_file_locked_error(code);
         if (!already_released_handles && lock_like && !ui().handles.empty())
         {
             // 第 2 道确认：强制关别人的句柄会影响别的程序，不能替用户点头

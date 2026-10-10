@@ -72,39 +72,36 @@ LocksmithResult find_locks(const std::vector<std::wstring>& paths, bool include_
 
     for (const auto& handle_info : nt_ext.handles(&result.handles_query_ok))
     {
-        if (handle_info.type_name == L"File")
+        auto path = kernel_paths_contain(handle_info.kernel_file_name);
+        if (!path.empty())
         {
-            auto path = kernel_paths_contain(handle_info.kernel_file_name);
-            if (!path.empty())
-            {
-                pid_files[handle_info.pid].insert(path);
-                result.handles.push_back(LockedHandle{
-                    static_cast<DWORD>(handle_info.pid),
-                    handle_info.handle,
-                    path,
-                    handle_info.kernel_file_name });
-            }
+            pid_files[handle_info.pid].insert(path);
+            result.handles.push_back(LockedHandle{
+                static_cast<DWORD>(handle_info.pid),
+                handle_info.handle,
+                path,
+                handle_info.kernel_file_name });
         }
     }
 
-    // Check all modules used by processes
-    auto processes = nt_ext.processes(&result.processes_query_ok);
+    // Check all modules used by processes.
+    // include_modules=false 时连模块枚举都不做：processes_ex 会跳过 EnumProcessModules +
+    // 每模块一次 GetModuleFileNameExW —— 那才是这一步慢的原因，--wait 的轮询靠它做廉价检查。
+    auto processes = nt_ext.processes_ex(&result.processes_query_ok, include_modules);
 
-    for (const auto& process : processes)
+    if (include_modules)
     {
-        if (!include_modules)
+        for (const auto& process : processes)
         {
-            break;
-        }
-
-        for (const auto& path : process.modules)
-        {
-            auto kernel_name = nt_ext.path_to_kernel_name(path.c_str());
-
-            auto found_path = kernel_paths_contain(kernel_name);
-            if (!found_path.empty())
+            for (const auto& path : process.modules)
             {
-                pid_files[process.pid].insert(std::move(found_path));
+                auto kernel_name = nt_ext.path_to_kernel_name(path.c_str());
+
+                auto found_path = kernel_paths_contain(kernel_name);
+                if (!found_path.empty())
+                {
+                    pid_files[process.pid].insert(std::move(found_path));
+                }
             }
         }
     }
@@ -299,6 +296,27 @@ void merge_process_results(std::vector<ProcessResult>& into, const std::vector<P
 
 namespace
 {
+    // SHFileOperation 和 MoveFileEx 都要求完整路径：相对路径在 SHFileOperation 里没有
+    // 明确定义的行为（README 的示例恰好就是 `FileLocksmith.exe report.docx --delete`
+    // 这种相对写法）。统一在这里补成绝对路径。
+    std::wstring absolute_path(const std::wstring& path)
+    {
+        std::vector<wchar_t> buffer(MAX_PATH * 2);
+        for (;;)
+        {
+            const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+            if (length == 0)
+            {
+                return path;  // 解析失败：原样返回，让系统调用给出它自己的错误码
+            }
+            if (length < buffer.size())
+            {
+                return std::wstring(buffer.data(), length);
+            }
+            buffer.resize(length);   // 缓冲区太小时返回的是"含结尾 \0 的所需长度"
+        }
+    }
+
     std::wstring describe_shell_error(int code)
     {
         switch (code)
@@ -340,7 +358,8 @@ bool delete_paths(const std::vector<std::wstring>& paths, std::wstring& error, i
     std::vector<wchar_t> list;
     for (const auto& path : paths)
     {
-        list.insert(list.end(), path.begin(), path.end());
+        const std::wstring full = absolute_path(path);
+        list.insert(list.end(), full.begin(), full.end());
         list.push_back(L'\0');
     }
     list.push_back(L'\0');
@@ -371,7 +390,8 @@ bool delete_on_reboot(const std::vector<std::wstring>& paths, std::wstring& erro
     {
         // MOVEFILE_DELAY_UNTIL_REBOOT 会把删除操作写进 PendingFileRenameOperations，
         // 需要管理员权限；而且不进回收站。
-        if (!MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
+        const std::wstring full = absolute_path(path);
+        if (!MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
         {
             const auto code = GetLastError();
             error = describe_shell_error(static_cast<int>(code));
@@ -383,4 +403,11 @@ bool delete_on_reboot(const std::vector<std::wstring>& paths, std::wstring& erro
         }
     }
     return true;
+}
+
+bool is_file_locked_error(int code)
+{
+    // ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED / DE_ACCESSDENIEDSRC(0x78)：
+    // 删除失败时只有这几类错误码意味着"文件被占用、重试可能有用"。
+    return code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
 }

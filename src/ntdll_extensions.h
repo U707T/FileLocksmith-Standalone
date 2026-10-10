@@ -37,7 +37,6 @@ public:
     {
         ULONG_PTR pid;
         ULONG_PTR handle;
-        std::wstring type_name;
         std::wstring kernel_file_name;
     };
 
@@ -49,6 +48,7 @@ public:
     std::wstring pid_to_user(DWORD pid);
 
     // Returns the list of handles currently existing in the system.
+    // Only handles whose object type is File are returned.
     // *ok is set to false when the query itself failed (so the caller can tell
     // "cannot enumerate" apart from "nothing is holding the file").
     std::vector<HandleInfo> handles(bool* ok = nullptr) noexcept;

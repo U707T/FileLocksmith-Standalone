@@ -23,6 +23,9 @@ struct FL_SYSTEM_PROCESS_INFORMATION
 
 namespace
 {
+    // 结果向量的初始容量（见 handles() 里的说明）
+    constexpr size_t InitialHandleResultCapacity = 16 * 1024;
+
     std::wstring unicode_to_str(UNICODE_STRING unicode_str)
     {
         return std::wstring(unicode_str.Buffer, unicode_str.Length / sizeof(WCHAR));
@@ -178,12 +181,27 @@ std::wstring NtdllExtensions::file_handle_to_kernel_name(HANDLE file_handle, std
         return L"";
     }
 
-    ULONG return_length;
+    ULONG return_length = 0;
     auto status = NtQueryObject(file_handle, ObjectNameInformationClass, buffer.data(), static_cast<ULONG>(buffer.size()), &return_length);
     if (NT_SUCCESS(status))
     {
         auto object_name_info = reinterpret_cast<UNICODE_STRING*>(buffer.data());
         return unicode_to_str(*object_name_info);
+    }
+
+    // 名字比缓冲区长（超长路径 / 罕见卷名）：换一块局部缓冲区重试一次。
+    // 刻意不去 resize 调用方的 buffer —— 工作线程可能因系统调用挂死被 TerminateThread，
+    // 共享容器的修改点越少越好。
+    if ((status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_OVERFLOW) &&
+        return_length > buffer.size() && return_length <= MaxResultBufferSize)
+    {
+        std::vector<BYTE> bigger(return_length);
+        status = NtQueryObject(file_handle, ObjectNameInformationClass, bigger.data(), static_cast<ULONG>(bigger.size()), &return_length);
+        if (NT_SUCCESS(status))
+        {
+            auto object_name_info = reinterpret_cast<UNICODE_STRING*>(bigger.data());
+            return unicode_to_str(*object_name_info);
+        }
     }
 
     return L"";
@@ -228,14 +246,39 @@ std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noex
 
     auto info_ptr = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(get_info_result.memory.data());
 
-    std::map<ULONG_PTR, HANDLE> pid_to_handle;
+    // 句柄表里出现过的进程在这里一次性全部打开，之后工作线程只读这张表（二分查找）。
+    //
+    // 工作线程里的系统调用会挂死、只能靠 TerminateThread 收拾（见下面的注释），所以它
+    // 绝不能写任何 STL 容器：如果在 std::map 插入的中途被杀，容器会停在半更新状态，
+    // 主线程之后读它 / 析构它就是未定义行为。预先开好、排好序的 POD 数组最坏也只是
+    // 留下一个失效条目（复制句柄失败、被忽略），不会破坏堆。
+    std::vector<std::pair<ULONG_PTR, HANDLE>> process_handles;
+    {
+        std::set<ULONG_PTR> pids;
+        for (ULONG_PTR k = 0; k < info_ptr->NumberOfHandles; ++k)
+        {
+            pids.insert(info_ptr->Handles[k].UniqueProcessId);
+        }
+        process_handles.reserve(pids.size());
+        for (auto pid : pids)
+        {
+            if (HANDLE process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, static_cast<DWORD>(pid)))
+            {
+                process_handles.emplace_back(pid, process);
+            }
+        }
+    }
+
     std::vector<HandleInfo> result;
+    // 预留容量：工作线程可能被 TerminateThread 打断，唯一真正危险的时刻是
+    // push_back 触发扩容重分配（旧缓冲已释放、成员指针还没更新，被杀就会指向已释放内存）。
+    // 预留后绝大多数机器（文件句柄数远小于这个量级）永远不会走到那条路径。
+    result.reserve(InitialHandleResultCapacity);
 
     std::vector<BYTE> object_info_buffer(DefaultResultBufferSize);
 
     std::atomic<ULONG> i = 0;
     std::atomic<ULONG_PTR> handle_count = info_ptr->NumberOfHandles;
-    std::atomic<HANDLE> process_handle = NULL;
     std::atomic<HANDLE> handle_copy = NULL;
     ULONG previous_i;
 
@@ -249,30 +292,22 @@ std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noex
         auto offload_function = std::thread([&] {
             for (; i < handle_count; i++)
             {
-                process_handle = NULL;
                 handle_copy = NULL;
 
                 auto handle_info = info_ptr->Handles + i;
                 auto pid = handle_info->UniqueProcessId;
 
-                auto iter = pid_to_handle.find(pid);
-                if (iter != pid_to_handle.end())
+                // 只读查找（进程句柄表由主线程预先开好，工作线程不写任何共享容器）
+                auto iter = std::lower_bound(process_handles.begin(), process_handles.end(), pid,
+                                             [](const std::pair<ULONG_PTR, HANDLE>& entry, ULONG_PTR value) { return entry.first < value; });
+                if (iter == process_handles.end() || iter->first != pid)
                 {
-                    process_handle = iter->second;
-                }
-                else
-                {
-                    process_handle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, static_cast<DWORD>(pid));
-                    if (!process_handle)
-                    {
-                        continue;
-                    }
-                    pid_to_handle[pid] = process_handle;
+                    continue;
                 }
 
                 // NtQueryObject can hang on some handles.
                 HANDLE local_handle_copy;
-                auto dh_result = DuplicateHandle(process_handle, reinterpret_cast<HANDLE>(handle_info->HandleValue), GetCurrentProcess(), &local_handle_copy, 0, 0, DUPLICATE_SAME_ACCESS);
+                auto dh_result = DuplicateHandle(iter->second, reinterpret_cast<HANDLE>(handle_info->HandleValue), GetCurrentProcess(), &local_handle_copy, 0, 0, DUPLICATE_SAME_ACCESS);
                 if (dh_result == 0)
                 {
                     // Ignore this handle.
@@ -302,7 +337,7 @@ std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noex
                 if (type_name == L"File")
                 {
                     file_name = file_handle_to_kernel_name(handle_copy, object_info_buffer);
-                    result.push_back(HandleInfo{ pid, handle_info->HandleValue, type_name, file_name });
+                    result.push_back(HandleInfo{ pid, handle_info->HandleValue, file_name });
                 }
 
                 CloseHandle(handle_copy);
@@ -325,6 +360,7 @@ std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noex
                 // The thread looks like it's hanging on some handle. Let's kill it and resume.
 
                 // HACK: This is unsafe and may leak something, but looks like there's no way to properly clean up a thread when it's hanging on a system call.
+                // 因为要在这条路径上杀线程：工作线程里不允许写任何共享容器 / 拿锁（见函数开头说明）。
                 TerminateThread(offload_function.native_handle(), 1);
 
                 // Close Handles that might be lingering.
@@ -339,7 +375,7 @@ std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noex
         } while (1);
     }
 
-    for (auto [pid, handle] : pid_to_handle)
+    for (auto& [pid, handle] : process_handles)
     {
         CloseHandle(handle);
     }
@@ -376,7 +412,12 @@ std::wstring NtdllExtensions::pid_to_user(DWORD pid)
     }
 
     std::vector<BYTE> token_buffer(token_size);
-    GetTokenInformation(token, TokenUser, token_buffer.data(), token_size, &token_size);
+    if (!GetTokenInformation(token, TokenUser, token_buffer.data(), token_size, &token_size))
+    {
+        CloseHandle(token);
+        CloseHandle(process);
+        return user;
+    }
     TOKEN_USER* user_ptr = reinterpret_cast<TOKEN_USER*>(token_buffer.data());
     PSID psid = user_ptr->User.Sid;
     DWORD user_buf_size = 0;

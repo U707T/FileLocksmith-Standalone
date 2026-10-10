@@ -74,10 +74,10 @@ FileLocksmith-Standalone/
 │   ├── cli.{h,cpp}             # 命令行模式
 │   ├── gui.h                   # 图形界面对外入口（gui::run）
 │   ├── gui_internal.h          # GUI 内部共享声明：常量、UiState、各文件函数
-│   ├── gui_chrome.cpp          # 窗口/控件/布局/字体与 DPI/菜单/图标/状态栏（349 行）
-│   ├── gui_search.cpp          # 扫描线程、路径收集、结果填充（195 行）
-│   ├── gui_actions.cpp         # 结束/解锁/删除/定位/复制/文件对话框（502 行）
-│   ├── gui_main.cpp            # 窗口过程与程序入口（514 行）
+│   ├── gui_chrome.cpp          # 窗口/控件/布局/字体与 DPI/菜单/图标/状态栏
+│   ├── gui_search.cpp          # 扫描线程、路径收集、结果填充
+│   ├── gui_actions.cpp         # 结束/解锁/删除/定位/复制/文件对话框
+│   ├── gui_main.cpp            # 窗口过程与程序入口
 │   ├── shell_integration.{h,cpp} # 资源管理器集成：右键菜单注册 / 「发送到」快捷方式（CLI 与 GUI 共用）
 │   └── main.cpp                # 入口：自动决定命令行还是图形界面
 └── dist/FileLocksmith.exe      # 本地构建产物（被 .gitignore 忽略，仓库不放二进制）

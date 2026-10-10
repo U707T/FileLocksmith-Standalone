@@ -109,11 +109,6 @@ namespace shell_integration
         return {};
     }
 
-    std::wstring context_menu_command()
-    {
-        return app::quote_arg(app::executable_path()) + L" \"%1\"";
-    }
-
     bool is_context_menu_installed()
     {
         return reg_key_exists(HKEY_CURRENT_USER, ContextMenuKeyFile) ||

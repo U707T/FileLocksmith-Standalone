@@ -14,7 +14,6 @@ namespace app
     // True when the process had to create its own console (so we should pause
     // before exiting, otherwise the window vanishes).
     bool own_console_created();
-    bool output_is_console();
     // Writes a wide string either to the console (proper Unicode) or as UTF-8
     // bytes when stdout is redirected to a file/pipe.
     void out(const std::wstring& text);
@@ -37,5 +36,4 @@ namespace app
     // ---- misc -------------------------------------------------------------
     std::string to_utf8(const std::wstring& text);
     std::wstring to_wstring(const char* utf8_text);
-    std::wstring exe_directory();
 }

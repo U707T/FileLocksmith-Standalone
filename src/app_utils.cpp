@@ -101,11 +101,6 @@ namespace app
         return g_own_console;
     }
 
-    bool output_is_console()
-    {
-        return g_out_is_console;
-    }
-
     namespace
     {
         void write_to(HANDLE handle, bool is_console, const std::wstring& text)
@@ -167,7 +162,7 @@ namespace app
         bool query_os_version(DWORD& major, DWORD& minor, DWORD& build)
         {
             using RtlGetVersion_t = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
-            auto get_version = reinterpret_cast<RtlGetVersion_t>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+            auto get_version = load_proc<RtlGetVersion_t>(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
             if (get_version == nullptr)
             {
                 return false;
@@ -330,13 +325,6 @@ namespace app
             }
             buffer.resize(buffer.size() * 2);
         }
-    }
-
-    std::wstring exe_directory()
-    {
-        auto path = executable_path();
-        auto pos = path.find_last_of(L"\\/");
-        return pos == std::wstring::npos ? std::wstring{} : path.substr(0, pos);
     }
 
     std::wstring quote_arg(const std::wstring& arg)

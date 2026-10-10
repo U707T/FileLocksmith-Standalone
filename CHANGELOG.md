@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.0.3 (2026-10-10)
+
+**全项目审计后的修复版：功能不变，修掉 6 个真实缺陷 + 1 类并发隐患，并做 4 项清理加固；两个工具链构建零告警。**
+
+### 修复
+
+- **`--wait` 的"廉价轮询"其实并不廉价**（`src/file_locksmith.cpp`）
+  `find_locks(paths, include_modules=false)` 只跳过了"模块与路径的匹配"，
+  进程枚举那一步照样执行 `EnumProcessModules` + 每个模块一次 `GetModuleFileNameExW` ——
+  也就是整个扫描里最慢的部分。现在 `processes_ex()` 真正跳过模块枚举，`--wait` 轮询不再秒级。
+- **`--unlock` / `--kill` 之后的结果刷新丢掉了"进程树展开"**（`src/cli.cpp`）
+  刷新直接拿原始参数重查；但 `.lnk` / `.exe` 参数走的是"展开该程序整棵进程树"那条路径，
+  重查等于把它们当普通文件 —— `FileLocksmith.exe app.lnk --kill` 之后会打印
+  "没有找到占用该文件的进程"这种误导结论。现在刷新统一走 `query_locks()`
+  （文件占用 + 展开进程树），与首次查询完全同一套逻辑。
+- **未知开关会被悄悄当成路径**（`src/cli.cpp`）
+  `--jsoon` 这类笔误以前变成"打不开这个文件"，让人一头雾水；现在直接报错并打印用法。
+  顺带把开关名单收敛成一张表同时供"是否命令行模式"判断使用 ——
+  以前有两份名单（`is_cli_flag` + 解析链），加开关漏改一处就会出现模式判断与解析行为不一致。
+- **相对路径 + `--delete` 依赖未定义行为**（`src/file_locksmith.cpp`）
+  `SHFileOperation` 要求完整路径，而 README 的示例恰好是
+  `FileLocksmith.exe report.docx --delete` 这种相对写法。现在统一经 `GetFullPathNameW`
+  补成绝对路径；`--delete-reboot` 同样处理。
+- **拖放 / 转发的路径里混进内嵌 `'\0'`**（`src/gui_main.cpp`）
+  `WM_COPYDATA` 发送方把结尾 NUL 也算进了 `cbData`，接收端按字节数当字符串长度，
+  于是每个路径末尾多带一个 `'\0'`（窗口标题、去重比较都会变得古怪）。现在按 `wcsnlen` 截断；
+  `WM_DROPFILES` 的缓冲区写法也改成不越界的形式。
+- **`pid_to_user()` 第二次 `GetTokenInformation` 没有检查返回值**
+  失败时会拿未初始化的缓冲区当 `TOKEN_USER` 用。
+
+### 并发 / 健壮性（扫描核心，行为不变）
+
+- 句柄枚举的工作线程可能因系统调用挂死被 `TerminateThread`（反挂起机制**保留不动**），
+  但原实现让工作线程直接写共享的 `std::map`（进程 → 句柄缓存）：若在插入中途被杀，
+  容器会停在半更新状态，主线程之后读它 / 析构它是未定义行为。
+  现在**进程句柄在起线程之前一次性开好**（排好序的 POD 数组，工作线程只做二分查找、纯只读），
+  结果向量也预留容量 —— 扩容重分配是唯一"旧缓冲已释放、成员指针未更新"的危险窗口。
+- `NtQueryObject` 名字缓冲区不足（超长路径 / 罕见卷名）时不再静默漏掉该句柄：
+  换一块局部缓冲区重试一次（刻意不动共享缓冲区）。
+
+### 清理
+
+- 删除没有调用方的死接口：`app::output_is_console()`、`app::exe_directory()`、
+  `shell_integration::context_menu_command()`；`HandleInfo` 去掉"存进去只为再判断一次"的
+  `type_name` 字段（句柄类型判断在枚举处已经做过）。
+- `GetProcAddress` 统一走 `load_proc<>()`（中转 `void(*)()`）：MinGW 构建从此**零告警**
+  （此前 6 条 `-Wcast-function-type` 噪音会淹没以后真正的告警）。
+- README 目录树不再写死文件行数（写死的数字已经漂了：gui_search 195→223、gui_actions 502→532…）。
+
+### 验证
+
+- 本地 MinGW release：零告警、零错误，PE 头（x64 / GUI 子系统 / 子系统版本 5.2）不变。
+- CI（Windows MSVC）11 个端到端用例照旧全跑，且本版本改动正落在这些用例覆盖的路径上
+  （`--json` 纯净性、无效路径、`--unlock` / `--delete` / `--no-unlock`、`--register` / `--sendto`）。
+
+### 本轮审计小结
+
+🔴 0 条；🟡 7 条（上面 6 个缺陷 + 共享容器隐患，全部已修）；🔵 4 条（死接口、构建告警、文档漂移、
+超长路径重试，已修）；🟢 核心反挂起设计、`unresolved_paths` 协议、"三道确认"删除流程维持原样 ——
+这些是本项目做得最对的地方，没有被"顺手优化"。
+
 ## 2.0.2 (2026-10-10)
 
 ### 修复 —— 2.0.1 引入的拖放死锁（我的回归）

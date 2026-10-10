@@ -153,7 +153,7 @@ namespace gui::detail
     UINT window_dpi(HWND hwnd)
     {
         using GetDpiForWindow_t = UINT(WINAPI*)(HWND);
-        static auto get_dpi = reinterpret_cast<GetDpiForWindow_t>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+        static auto get_dpi = load_proc<GetDpiForWindow_t>(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
         return (get_dpi != nullptr && hwnd != nullptr) ? get_dpi(hwnd) : 0;
     }
 
@@ -164,8 +164,8 @@ namespace gui::detail
 
         // SystemParametersInfoForDpi 是 Win10 1607+（5 个参数），老系统退回普通版
         using SystemParametersInfoForDpi_t = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
-        static auto spi_for_dpi = reinterpret_cast<SystemParametersInfoForDpi_t>(
-            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+        static auto spi_for_dpi = load_proc<SystemParametersInfoForDpi_t>(
+            GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi");
 
         bool ok = false;
         if (spi_for_dpi != nullptr && dpi != 0)

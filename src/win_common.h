@@ -57,6 +57,20 @@
 #ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
+#ifndef STATUS_BUFFER_OVERFLOW
+#define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
+#endif
+
+// ---------------------------------------------------------------------------
+// GetProcAddress 返回 FARPROC：直接 reinterpret_cast 到目标函数指针会让 GCC 报
+// -Wcast-function-type（MSVC 不报）。中转一层 void(*)() —— GCC 把 void(*)() 当作
+// "与任何函数类型兼容"，两个工具链都无告警，构建输出保持干净。
+// ---------------------------------------------------------------------------
+template <typename Fn>
+inline Fn load_proc(HMODULE module, const char* name)
+{
+    return reinterpret_cast<Fn>(reinterpret_cast<void (*)()>(GetProcAddress(module, name)));
+}
 
 // SystemExtendedHandleInformation is not exposed by any public header.
 static constexpr ULONG SystemExtendedHandleInformationClass = 64;

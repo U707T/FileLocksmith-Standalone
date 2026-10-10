@@ -53,6 +53,9 @@ void merge_process_results(std::vector<ProcessResult>& into, const std::vector<P
 // 删除路径（进回收站，可撤销）。部分失败时返回 false 并给出原因。
 bool delete_paths(const std::vector<std::wstring>& paths, std::wstring& error, int* error_code = nullptr);
 
+// 删除失败的错误码是不是"被占用"这一类（调用方据此决定要不要强制关句柄/重试）
+bool is_file_locked_error(int code);
+
 // 安排"重启后删除"（不进回收站；需要管理员权限）
 bool delete_on_reboot(const std::vector<std::wstring>& paths, std::wstring& error);
 

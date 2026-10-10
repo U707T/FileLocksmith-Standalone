@@ -194,10 +194,16 @@ namespace gui::detail
             std::vector<std::wstring> dropped;
             for (UINT i = 0; i < count; ++i)
             {
-                UINT length = DragQueryFileW(drop, i, nullptr, 0);
-                std::wstring path(length, L'\0');
-                if (DragQueryFileW(drop, i, path.data(), length + 1) != 0)
+                const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+                if (length == 0)
                 {
+                    continue;
+                }
+                // 缓冲区长出一格再按查询到的长度截断：直接写 data()[size()] 属于越界写
+                std::wstring path(static_cast<size_t>(length) + 2, L'\0');
+                if (DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size())) != 0)
+                {
+                    path.resize(length);
                     dropped.push_back(path);
                 }
             }
@@ -215,7 +221,10 @@ namespace gui::detail
             }
 
             auto text = reinterpret_cast<const wchar_t*>(data->lpData);
-            size_t length = data->cbData / sizeof(wchar_t);
+            // 发送方把结尾的 '\0' 也算进了 cbData：按 NUL 截断，否则每个路径都会带上
+            // 一个内嵌的 '\0'（标题栏显示、去重比较都会变得古怪）。
+            const size_t capacity = data->cbData / sizeof(wchar_t);
+            const size_t length = wcsnlen(text, capacity);
             std::wstring joined(text, length);
 
             std::vector<std::wstring> incoming;

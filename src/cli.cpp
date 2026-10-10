@@ -195,12 +195,32 @@ namespace
         return 0;
     }
 
+    // 全部开关只有这一份名单：既给"是不是命令行模式"判断用（is_cli_flag），
+    // 也给"未知开关要报错"用。以前解析链里另有一份隐式名单，加开关时漏掉一处，
+    // 就会出现"模式判断和解析行为不一致"。
+    constexpr const wchar_t* kKnownFlags[] = {
+        L"--json", L"--kill", L"--unlock", L"--wait", L"--timeout",
+        L"--sendto", L"--delete", L"--delete-reboot", L"--no-unlock",
+        L"--help", L"-h", L"--version", L"--cli", L"--gui",
+        L"--register", L"--unregister", L"--elevate",
+    };
+
+    bool is_known_flag(const std::wstring& arg)
+    {
+        for (const auto* flag : kKnownFlags)
+        {
+            if (arg == flag)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool is_cli_flag(const std::wstring& arg)
     {
-        return arg == L"--json" || arg == L"--kill" || arg == L"--unlock" || arg == L"--wait" || arg == L"--timeout" ||
-               arg == L"--sendto" || arg == L"--delete" || arg == L"--delete-reboot" || arg == L"--no-unlock" ||
-               arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
-               arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
+        // --gui 不算：它的作用就是"别进命令行模式"
+        return arg != L"--gui" && is_known_flag(arg);
     }
 }
 
@@ -311,6 +331,13 @@ int cli_main(const std::vector<std::wstring>& args)
         else if (arg == L"--cli" || arg == L"--gui")
         {
             // Handled by main().
+        }
+        else if (!arg.empty() && arg[0] == L'-')
+        {
+            // 未知开关不再悄悄当成路径：`--jsoon` 这种笔误以前会变成"打不开这个文件"，
+            // 让人一头雾水。现在直接报错退出。
+            app::out(L"错误: 未知选项 " + arg + L"\n\n" + usage());
+            return 1;
         }
         else
         {
@@ -469,38 +496,40 @@ int cli_main(const std::vector<std::wstring>& args)
         }
     }
 
-    LocksmithResult locks;
-    if (!file_paths.empty())
-    {
-        try
+    // 一次完整查询 = 文件占用 + 快捷方式/exe 展开出的整棵进程树。
+    // --unlock / --kill 之后刷新结果也走这里：之前刷新只拿原始 paths 重查（里面混着
+    // .lnk / .exe），展开出来的进程树整块丢失，输出会变成误导性的"没有找到占用"。
+    auto query_locks = [&](bool include_modules, bool verbose) {
+        LocksmithResult combined;
+        combined.handles_query_ok = true;
+        combined.processes_query_ok = true;
+        if (!file_paths.empty())
         {
-            locks = find_locks(file_paths);
+            combined = find_locks(file_paths, include_modules);
         }
-        catch (const std::exception& ex)
-        {
-            app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
-            return 1;
-        }
-    }
-    else
-    {
-        locks.handles_query_ok = true;
-        locks.processes_query_ok = true;
-    }
 
-    // 把快捷方式/可执行文件展开成整棵进程树
-    for (const auto& target : app_targets)
+        for (const auto& target : app_targets)
+        {
+            auto extra = find_application_processes(target, /* include_children */ true);
+            if (verbose)
+            {
+                note(extra.empty() ? L"没有找到正在运行的程序: " + target + L"\n"
+                                   : L"程序 " + target + L": 找到 " + std::to_wstring(extra.size()) + L" 个进程（含子进程）\n");
+            }
+            merge_process_results(combined.processes, extra);
+        }
+        return combined;
+    };
+
+    LocksmithResult locks;
+    try
     {
-        auto extra = find_application_processes(target, /* include_children */ true);
-        if (extra.empty())
-        {
-            note(L"没有找到正在运行的程序: " + target + L"\n");
-        }
-        else
-        {
-            note(L"程序 " + target + L": 找到 " + std::to_wstring(extra.size()) + L" 个进程（含子进程）\n");
-        }
-        merge_process_results(locks.processes, extra);
+        locks = query_locks(/* include_modules */ true, /* verbose */ true);
+    }
+    catch (const std::exception& ex)
+    {
+        app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
+        return 1;
     }
 
     std::vector<ProcessResult> results = locks.processes;
@@ -542,7 +571,7 @@ int cli_main(const std::vector<std::wstring>& args)
 
         try
         {
-            locks = find_locks(paths);
+            locks = query_locks(/* include_modules */ true, /* verbose */ false);
             results = locks.processes;
         }
         catch (const std::exception&)
@@ -585,7 +614,7 @@ int cli_main(const std::vector<std::wstring>& args)
             }
             else
             {
-                const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
+                const bool lock_like = is_file_locked_error(code);
                 if (lock_like && no_unlock)
                 {
                     note(L"（--no-unlock：不会替你去关占用者的句柄）\n");
@@ -634,7 +663,7 @@ int cli_main(const std::vector<std::wstring>& args)
         note(kill_processes(results));
         try
         {
-            results = find_processes_recursive(paths);
+            results = query_locks(/* include_modules */ true, /* verbose */ false).processes;
         }
         catch (const std::exception&)
         {
