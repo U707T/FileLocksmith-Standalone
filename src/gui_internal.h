@@ -59,16 +59,15 @@ namespace gui::detail
         int id;
         const wchar_t* text;
         const wchar_t* tip;    // 悬停提示：三个"危险动作"的区别只靠文案是分不清的
-        bool starts_group;     // true = 归入"查看类"右组（宽度按文字实测，不再写死）
     };
     inline constexpr ButtonSpec kButtonSpec[] = {
-        // 左组 = 对结果的动作（都有确认框）；右组 = 查看类，布局时贴右边缘
-        { IDC_KILL_SELECTED, L"结束进程", L"结束选中的进程（未保存的数据会丢失）", false },
-        { IDC_KILL_ALL, L"全部结束", L"结束列表里的全部占用进程（不只是选中的）", false },
-        { IDC_FORCE_UNLOCK, L"强制解锁", L"只关闭它们的文件句柄、不结束进程；持有句柄的程序可能出现异常", false },
-        { IDC_DELETE_FILES, L"删除检查的文件…", L"删除正在检查的这些文件（进回收站；被占用时会单独问你一次）", false },
-        { IDC_REFRESH, L"重新检查", L"重新扫描（F5）", true },
-        { IDC_OPEN_LOCATION, L"打开所在位置", L"在资源管理器中定位选中的文件（双击列表也可以）", true },
+        // 顺序 = 左边到右边；间距全行统一（宽度按文字实测），不再有"分组间距"
+        { IDC_KILL_SELECTED, L"结束进程", L"结束选中的进程（未保存的数据会丢失）" },
+        { IDC_KILL_ALL, L"全部结束", L"结束列表里的全部占用进程（不只是选中的）" },
+        { IDC_FORCE_UNLOCK, L"强制解锁", L"只关闭它们的文件句柄、不结束进程；持有句柄的程序可能出现异常" },
+        { IDC_DELETE_FILES, L"删除检查的文件…", L"删除正在检查的这些文件（进回收站；被占用时会单独问你一次）" },
+        { IDC_REFRESH, L"重新检查", L"重新扫描（F5）" },
+        { IDC_OPEN_LOCATION, L"打开所在位置", L"在资源管理器中定位选中的文件（双击列表也可以）" },
     };
     constexpr int BUTTON_COUNT = static_cast<int>(sizeof(kButtonSpec) / sizeof(kButtonSpec[0]));
     constexpr UINT WM_FL_SEARCH_DONE = WM_APP + 1;
@@ -108,6 +107,7 @@ namespace gui::detail
         HWND headline = nullptr;
         HWND empty_hint = nullptr;
         HWND tooltip = nullptr;
+        HWND hot_button = nullptr;               // 鼠标悬停的按钮（自绘用）
         HWND buttons [BUTTON_COUNT] = {};
         int button_widths [BUTTON_COUNT] = {};   // 按文字实测（compute_button_widths）
         HFONT font = nullptr;
@@ -151,7 +151,11 @@ namespace gui::detail
     int scale(int value);
     // 按钮宽度 = 文字实测宽度 + 两侧内边距（含 DPI/字体缩放），改字体或 DPI 后要重算
     void compute_button_widths();
-    // 按钮行需要的总宽度（左组 + 右组 + 边距），布局与最小窗口尺寸共用同一份算法
+    // 按钮自绘（圆角）：GDI+ 可用时带抗锯齿，否则退回 GDI RoundRect
+    bool init_button_rendering();
+    void draw_button(const DRAWITEMSTRUCT& item);
+    void shutdown_button_rendering();
+    // 按钮行需要的总宽度（窄到极限时的最小宽度），布局与最小窗口尺寸共用同一份算法
     int buttons_row_width();
     // 按控件 ID 找按钮：避免"数组下标 = 语义"的隐式耦合（改一次按钮表就可能错位）
     HWND button_by_id(int id);

@@ -169,19 +169,13 @@ namespace gui::detail
 
     int buttons_row_width()
     {
-        auto group_width = [](bool view_group) {
-            int total = 0;
-            for (int i = 0; i < BUTTON_COUNT; ++i)
-            {
-                if (kButtonSpec[i].starts_group == view_group)
-                {
-                    total += ui().button_widths[i] + scale(8);
-                }
-            }
-            return total;
-        };
-        // 左组 + 两组之间最少的留白 + 右组 + 左右边距
-        return scale(12) * 2 + group_width(false) + scale(24) + group_width(true);
+        // 窄到极限时的最小宽度：所有按钮 + 最小间距 + 左右边距
+        int total = 0;
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            total += ui().button_widths[i];
+        }
+        return scale(12) * 2 + total + scale(8) * (BUTTON_COUNT - 1);
     }
 
     HWND button_by_id(int id)
@@ -237,19 +231,31 @@ namespace gui::detail
         }
         y += remaining + gap + scale(4);
 
-        int x = margin;
-        for (int i = 0; i < BUTTON_COUNT && !kButtonSpec[i].starts_group; ++i)
+        // 按钮全行等距：间隔一致，窗口富余时整行居中（不硬撑、也不挤在左边）
+        int row_total = 0;
+        for (int i = 0; i < BUTTON_COUNT; ++i)
         {
-            MoveWindow(ui().buttons[i], x, y, ui().button_widths[i], button_height, TRUE);
-            x += ui().button_widths[i] + gap;
+            row_total += ui().button_widths[i];
         }
-        // 右组（查看类）贴住右边缘：中间留白由窗口宽度吸收，不会只在左边挤成一串
-        x = client.right - margin;
-        for (int i = BUTTON_COUNT - 1; i >= 0 && kButtonSpec[i].starts_group; --i)
+        const int available = client.right - margin * 2;
+        int slot_gap = scale(8);
+        if (BUTTON_COUNT > 1)
         {
-            x -= ui().button_widths[i];
+            slot_gap = (available - row_total) / (BUTTON_COUNT - 1);
+            if (slot_gap < scale(8))
+            {
+                slot_gap = scale(8);
+            }
+            if (slot_gap > scale(20))
+            {
+                slot_gap = scale(20);
+            }
+        }
+        int x = margin + (available - (row_total + slot_gap * (BUTTON_COUNT - 1))) / 2;
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
             MoveWindow(ui().buttons[i], x, y, ui().button_widths[i], button_height, TRUE);
-            x -= gap;
+            x += ui().button_widths[i] + slot_gap;
         }
 
         MoveWindow(ui().status, margin, y + button_height + scale(4), client.right - 2 * margin, status_height, TRUE);
@@ -293,6 +299,28 @@ namespace gui::detail
             {
                 SendMessageW(ui().window, WM_DROPFILES, w_param, l_param);
                 return 0;
+            }
+        }
+        else if (message == WM_MOUSEMOVE && (GetWindowLongPtrW(hwnd, GWL_STYLE) & BS_OWNERDRAW) != 0)
+        {
+            // 自绘按钮的悬停反馈（原生按钮自带，owner-draw 之后要自己跟踪）
+            if (ui().hot_button != hwnd)
+            {
+                ui().hot_button = hwnd;
+                TRACKMOUSEEVENT track{};
+                track.cbSize = sizeof(track);
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                TrackMouseEvent(&track);
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+        }
+        else if (message == WM_MOUSELEAVE)
+        {
+            if (ui().hot_button == hwnd)
+            {
+                ui().hot_button = nullptr;
+                InvalidateRect(hwnd, nullptr, TRUE);
             }
         }
         else if (message == WM_NCDESTROY)
@@ -395,6 +423,210 @@ namespace gui::detail
 
         ui().icon_cache[path] = index;
         return index;
+    }
+
+    namespace
+    {
+        // ---- 圆角按钮：GDI+ 抗锯齿 ------------------------------------------------
+        // gdiplus.dll 系统自带；这里动态加载（不新增链接依赖），拿不到就退回 GDI 的
+        // RoundRect —— 边缘没有抗锯齿，但按钮一定画得出来。
+        using ArgsColor = DWORD;
+        constexpr INT kSmoothingAntiAlias = 4;
+        constexpr INT kFillModeWinding = 1;
+        constexpr INT kUnitPixel = 2;
+
+        struct GdiPlusApi
+        {
+            HMODULE module = nullptr;
+            INT(WINAPI* startup)(ULONG_PTR*, const void*, void**) = nullptr;
+            void(WINAPI* shutdown)(ULONG_PTR) = nullptr;
+            INT(WINAPI* create_graphics)(HDC, void**) = nullptr;
+            INT(WINAPI* delete_graphics)(void*) = nullptr;
+            INT(WINAPI* set_smoothing)(void*, INT) = nullptr;
+            INT(WINAPI* create_path)(INT, void**) = nullptr;
+            INT(WINAPI* add_arc)(void*, float, float, float, float, float, float) = nullptr;
+            INT(WINAPI* close_figure)(void*) = nullptr;
+            INT(WINAPI* create_fill)(ArgsColor, void**) = nullptr;
+            INT(WINAPI* fill_path)(void*, void*, void*) = nullptr;
+            INT(WINAPI* create_pen)(ArgsColor, float, INT, void**) = nullptr;
+            INT(WINAPI* draw_path)(void*, void*, void*) = nullptr;
+            INT(WINAPI* delete_brush)(void*) = nullptr;
+            INT(WINAPI* delete_pen)(void*) = nullptr;
+            INT(WINAPI* delete_path)(void*) = nullptr;
+
+            template <typename Fn>
+            bool bind(Fn& target, const char* name)
+            {
+                target = load_proc<Fn>(module, name);
+                return target != nullptr;
+            }
+        };
+
+        GdiPlusApi g_gdiplus;
+        bool g_gdiplus_ready = false;
+        bool g_gdiplus_probed = false;
+        ULONG_PTR g_gdiplus_token = 0;
+
+        ArgsColor gdiplus_color(COLORREF color)
+        {
+            return 0xFF000000u | (static_cast<ArgsColor>(GetRValue(color)) << 16) |
+                   (static_cast<ArgsColor>(GetGValue(color)) << 8) | static_cast<ArgsColor>(GetBValue(color));
+        }
+
+        void fill_rounded_rect(HDC dc, const RECT& rect, int radius, COLORREF fill, COLORREF border, bool antialias)
+        {
+            const float left = static_cast<float>(rect.left) + 0.5f;
+            const float top = static_cast<float>(rect.top) + 0.5f;
+            const float width = static_cast<float>(rect.right - rect.left) - 1.0f;
+            const float height = static_cast<float>(rect.bottom - rect.top) - 1.0f;
+            const float diameter = static_cast<float>(radius) * 2.0f;
+
+            if (antialias && g_gdiplus_ready)
+            {
+                void* graphics = nullptr;
+                void* path = nullptr;
+                if (g_gdiplus.create_graphics(dc, &graphics) == 0 && graphics != nullptr &&
+                    g_gdiplus.create_path(kFillModeWinding, &path) == 0 && path != nullptr)
+                {
+                    g_gdiplus.add_arc(path, left, top, diameter, diameter, 180.0f, 90.0f);
+                    g_gdiplus.add_arc(path, left + width - diameter, top, diameter, diameter, 270.0f, 90.0f);
+                    g_gdiplus.add_arc(path, left + width - diameter, top + height - diameter, diameter, diameter, 0.0f, 90.0f);
+                    g_gdiplus.add_arc(path, left, top + height - diameter, diameter, diameter, 90.0f, 90.0f);
+                    g_gdiplus.close_figure(path);
+                    g_gdiplus.set_smoothing(graphics, kSmoothingAntiAlias);
+
+                    void* brush = nullptr;
+                    if (g_gdiplus.create_fill(gdiplus_color(fill), &brush) == 0 && brush != nullptr)
+                    {
+                        g_gdiplus.fill_path(graphics, path, brush);
+                        g_gdiplus.delete_brush(brush);
+                    }
+                    void* pen = nullptr;
+                    if (g_gdiplus.create_pen(gdiplus_color(border), 1.0f, kUnitPixel, &pen) == 0 && pen != nullptr)
+                    {
+                        g_gdiplus.draw_path(graphics, path, pen);
+                        g_gdiplus.delete_pen(pen);
+                    }
+                    g_gdiplus.delete_path(path);
+                }
+                if (graphics != nullptr)
+                {
+                    g_gdiplus.delete_graphics(graphics);
+                }
+                return;
+            }
+
+            HBRUSH brush = CreateSolidBrush(fill);
+            HPEN pen = CreatePen(PS_SOLID, 1, border);
+            HGDIOBJ previous_brush = SelectObject(dc, brush);
+            HGDIOBJ previous_pen = SelectObject(dc, pen);
+            RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+            SelectObject(dc, previous_pen);
+            SelectObject(dc, previous_brush);
+            DeleteObject(pen);
+            DeleteObject(brush);
+        }
+    }
+
+    bool init_button_rendering()
+    {
+        if (!g_gdiplus_probed)
+        {
+            g_gdiplus_probed = true;
+            g_gdiplus.module = LoadLibraryW(L"gdiplus.dll");
+            if (g_gdiplus.module != nullptr)
+            {
+                bool ok = true;
+                ok = g_gdiplus.bind(g_gdiplus.startup, "GdiplusStartup") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.shutdown, "GdiplusShutdown") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.create_graphics, "GdipCreateFromHDC") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.delete_graphics, "GdipDeleteGraphics") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.set_smoothing, "GdipSetSmoothingMode") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.create_path, "GdipCreatePath") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.add_arc, "GdipAddPathArc") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.close_figure, "GdipClosePathFigure") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.create_fill, "GdipCreateSolidFill") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.fill_path, "GdipFillPath") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.create_pen, "GdipCreatePen1") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.draw_path, "GdipDrawPath") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.delete_brush, "GdipDeleteBrush") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.delete_pen, "GdipDeletePen") && ok;
+                ok = g_gdiplus.bind(g_gdiplus.delete_path, "GdipDeletePath") && ok;
+                if (ok)
+                {
+                    struct StartupInput
+                    {
+                        UINT32 version;
+                        void* callback;
+                        BOOL suppress_background;
+                        BOOL suppress_codecs;
+                    } input{ 1, nullptr, FALSE, FALSE };
+                    g_gdiplus_ready = g_gdiplus.startup(&g_gdiplus_token, &input, nullptr) == 0;
+                }
+            }
+        }
+        return g_gdiplus_ready;
+    }
+
+    void shutdown_button_rendering()
+    {
+        if (g_gdiplus_ready && g_gdiplus.shutdown != nullptr)
+        {
+            g_gdiplus.shutdown(g_gdiplus_token);
+            g_gdiplus_ready = false;
+        }
+    }
+
+    void draw_button(const DRAWITEMSTRUCT& item)
+    {
+        HDC dc = item.hDC;
+        RECT rect = item.rcItem;
+        const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+        const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+        const bool hot = !disabled && ui().hot_button == item.hwndItem;
+
+        // 按钮画的是圆角：四角必须先露出窗口底色
+        FillRect(dc, &rect, GetSysColorBrush(COLOR_WINDOW));
+
+        COLORREF fill = RGB(253, 253, 253);
+        COLORREF border = RGB(214, 214, 214);
+        if (disabled)
+        {
+            fill = RGB(250, 250, 250);
+            border = RGB(232, 232, 232);
+        }
+        else if (pressed)
+        {
+            fill = RGB(233, 233, 233);
+            border = RGB(188, 188, 188);
+        }
+        else if (hot)
+        {
+            fill = RGB(245, 245, 245);
+            border = RGB(188, 188, 188);
+        }
+
+        fill_rounded_rect(dc, rect, scale(6), fill, border, /* antialias */ true);
+
+        wchar_t text[128]{};
+        const int length = GetWindowTextW(item.hwndItem, text, ARRAYSIZE(text));
+        RECT text_rect = rect;
+        if (pressed)
+        {
+            OffsetRect(&text_rect, 0, scale(1));   // 按下时文字下沉 1px
+        }
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, disabled ? GetSysColor(COLOR_GRAYTEXT) : GetSysColor(COLOR_WINDOWTEXT));
+        HGDIOBJ previous = SelectObject(dc, ui().font != nullptr ? ui().font : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc, text, length, &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, previous);
+
+        if (!disabled && (item.itemState & ODS_FOCUS) != 0)
+        {
+            RECT focus = rect;
+            InflateRect(&focus, -scale(4), -scale(4));
+            DrawFocusRect(dc, &focus);
+        }
     }
 
     void init_list_extras()

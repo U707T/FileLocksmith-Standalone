@@ -95,9 +95,11 @@ namespace gui::detail
 
             for (int i = 0; i < BUTTON_COUNT; ++i)
             {
-                ui().buttons[i] = CreateWindowExW(0, L"BUTTON", kButtonSpec[i].text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                // BS_OWNERDRAW：按钮是自绘的圆角（见 gui_chrome.cpp 的 draw_button）
+                ui().buttons[i] = CreateWindowExW(0, L"BUTTON", kButtonSpec[i].text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                                0, 0, 0, 0, hwnd, control_id(kButtonSpec[i].id), ui().instance, nullptr);
             }
+            init_button_rendering();
             init_tooltips(hwnd);
             init_list_extras();
             compute_button_widths();
@@ -283,6 +285,17 @@ namespace gui::detail
             SetForegroundWindow(ui().window);
             add_paths(incoming, /* replace */ true);
             return TRUE;
+        }
+
+        case WM_DRAWITEM:
+        {
+            auto item = reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
+            if (item != nullptr && item->CtlType == ODT_BUTTON)
+            {
+                draw_button(*item);
+                return TRUE;
+            }
+            break;
         }
 
         case WM_CTLCOLORSTATIC:
@@ -489,6 +502,7 @@ namespace gui::detail
                 DestroyIcon(ui().header_icon_handle);
                 ui().header_icon_handle = nullptr;
             }
+            shutdown_button_rendering();
             ui().post_target.store(nullptr);
             ui().window = nullptr;
             PostQuitMessage(0);
