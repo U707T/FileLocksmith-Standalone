@@ -13,8 +13,7 @@ namespace gui::detail
     }
 
     void fill_list()
-    {
-        // 每个进程占了多少个句柄：0 个说明只是模块映射（文件被当成 DLL/EXE 加载）
+    {        // 每个进程占了多少个句柄：0 个说明只是模块映射（文件被当成 DLL/EXE 加载）
         std::map<DWORD, int> handle_counts;
         for (const auto& handle : ui().handles)
         {
@@ -57,6 +56,7 @@ namespace gui::detail
         SendMessageW(ui().list, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(ui().list, nullptr, TRUE);
         update_button_states();
+        update_empty_hint();
     }
 
     void start_search()
@@ -78,6 +78,7 @@ namespace gui::detail
 
         ui().searching = true;
         set_busy(true);
+        update_empty_hint();   // 扫描期间把空态提示收起来
         ui().busy_started = GetTickCount();
         SetTimer(ui().window, BUSY_TIMER_ID, 500, nullptr);
         ui().worker_running.store(true);
@@ -173,7 +174,7 @@ namespace gui::detail
             }
         }
 
-        update_path_label();
+        update_header();
         start_search();
     }
 
@@ -191,6 +192,7 @@ namespace gui::detail
             ListView_DeleteAllItems(ui().list);
         }
         update_button_states();
+        update_empty_hint();
     }
 
     void add_app_target(const std::wstring& target)

@@ -21,28 +21,34 @@ namespace gui::detail
         SetWindowTextW(ui().status, text.c_str());
     }
 
-    void update_path_label()
+    void update_header()
     {
-        std::wstring text;
+        std::wstring headline;
+        std::wstring subline;
+
         if (ui().paths.empty())
         {
-            text = L"把文件或文件夹拖到窗口里（也可以拖到 exe 图标上）";
-            if (app::is_process_elevated())
-            {
-                text += L"\n当前是管理员模式：若拖放无反应（UIPI），请用「文件 → 检查文件… / 检查文件夹…」";
-            }
+            headline = L"拖入文件或文件夹开始检查";
+            subline = L"支持 .lnk / .exe（展开整棵进程树）；也可以按 Ctrl+O 选择文件";
         }
-        else if (ui().paths.size() <= 2)
+        else if (ui().paths.size() == 1)
         {
-            text = L"正在检查: " + join(ui().paths, L"\n");
+            headline = L"正在检查 1 个文件";
+            subline = ui().paths[0];
         }
         else
         {
-            // 标签只有两行高，路径多了要收敛，不然用户以为只查了前面的
-            text = L"正在检查 " + std::to_wstring(ui().paths.size()) + L" 个路径: " + ui().paths[0] +
-                   L"、" + ui().paths[1] + L" …";
+            headline = L"正在检查 " + std::to_wstring(ui().paths.size()) + L" 个路径";
+            subline = join(ui().paths, L"    ");
         }
-        SetWindowTextW(ui().path_label, text.c_str());
+
+        if (app::is_process_elevated())
+        {
+            subline += L"　（管理员模式：若拖放无反应，请用「文件 → 检查文件…」）";
+        }
+
+        SetWindowTextW(ui().headline, headline.c_str());
+        SetWindowTextW(ui().subline, subline.c_str());
 
         // 标题：一个路径时直接显示文件名（比"N 个路径"有信息量），空的时候保留标语
         std::wstring title = L"FileLocksmith";
@@ -68,6 +74,24 @@ namespace gui::detail
         {
             SetWindowTextW(ui().window, title.c_str());
         }
+    }
+
+    void update_empty_hint()
+    {
+        if (ui().empty_hint == nullptr)
+        {
+            return;
+        }
+        // 只在"没有结果、也没在扫描"时显示（列表为空时它就是视觉重心）
+        const bool show = ui().results.empty() && !ui().searching;
+        if (show)
+        {
+            SetWindowTextW(ui().empty_hint,
+                           ui().paths.empty()
+                               ? L"把文件或文件夹拖到这里\n或按 Ctrl+O 选择文件"
+                               : L"没有进程占用这些文件\n（列表里只列出占用者）");
+        }
+        ShowWindow(ui().empty_hint, show ? SW_SHOW : SW_HIDE);
     }
 
     void resize_columns(int list_width)
@@ -118,14 +142,14 @@ namespace gui::detail
 
     int buttons_row_width()
     {
-        int width = scale(10) * 2;   // 左右边距
+        int width = scale(12) * 2;   // 左右边距（与 layout() 保持一致）
         for (int i = 0; i < BUTTON_COUNT; ++i)
         {
             if (kButtonSpec[i].starts_group && i > 0)
             {
-                width += scale(22) - scale(6);   // 分组间距（多算的那一个普通 gap 要扣掉）
+                width += scale(30) - scale(8);   // 分组间距（多算的那一个普通 gap 要扣掉）
             }
-            width += scale(kButtonSpec[i].width) + scale(6);
+            width += scale(kButtonSpec[i].width) + scale(8);
         }
         return width;
     }
@@ -147,24 +171,42 @@ namespace gui::detail
         RECT client{};
         GetClientRect(hwnd, &client);
 
-        const int margin = scale(10);
-        const int gap = scale(6);
-        const int group_gap = scale(22);
-        const int label_height = scale(46);
+        const int margin = scale(12);
+        const int gap = scale(8);
+        const int group_gap = scale(30);
+        const int icon_size = scale(32);
+        const int headline_height = scale(22);
+        const int subline_height = scale(20);
+        const int header_height = scale(56);
         const int button_height = scale(30);
         const int status_height = scale(22);
 
-        int y = margin;
-        MoveWindow(ui().path_label, margin, y, client.right - 2 * margin, label_height, TRUE);
-        y += label_height + gap;
+        // 头部：图标 + 半粗标题 + 灰色副标题（三行信息，取代原来一行 12px 小字）
+        MoveWindow(ui().header_icon, margin, margin + scale(6), icon_size, icon_size, TRUE);
+        const int text_x = margin + icon_size + scale(12);
+        const int text_width = client.right - text_x - margin;
+        MoveWindow(ui().headline, text_x, margin + scale(3), text_width, headline_height, TRUE);
+        MoveWindow(ui().subline, text_x, margin + scale(3) + headline_height, text_width, subline_height, TRUE);
 
-        int remaining = client.bottom - y - button_height - status_height - margin - gap;
+        int y = margin + header_height + gap;
+        int remaining = client.bottom - y - button_height - status_height - margin - gap - scale(4);
         if (remaining < scale(60))
         {
             remaining = scale(60);
         }
         MoveWindow(ui().list, margin, y, client.right - 2 * margin, remaining, TRUE);
-        y += remaining + gap;
+
+        // 空态提示：居中放在列表区域里（列表为空时它就是视觉重心）
+        if (ui().empty_hint != nullptr)
+        {
+            const int hint_width = scale(340);
+            const int hint_height = scale(56);
+            MoveWindow(ui().empty_hint,
+                       margin + (client.right - 2 * margin - hint_width) / 2,
+                       y + (remaining - hint_height) / 2,
+                       hint_width, hint_height, TRUE);
+        }
+        y += remaining + gap + scale(4);
 
         int x = margin;
         for (int i = 0; i < BUTTON_COUNT; ++i)
@@ -178,7 +220,7 @@ namespace gui::detail
             x += width + gap;
         }
 
-        MoveWindow(ui().status, margin, y + button_height + scale(3), client.right - 2 * margin, status_height, TRUE);
+        MoveWindow(ui().status, margin, y + button_height + scale(4), client.right - 2 * margin, status_height, TRUE);
 
         resize_columns(client.right - 2 * margin);
     }
@@ -236,7 +278,7 @@ namespace gui::detail
         return (get_dpi != nullptr && hwnd != nullptr) ? get_dpi(hwnd) : 0;
     }
 
-    HFONT create_ui_font(UINT dpi)
+    HFONT create_ui_font(UINT dpi, LONG weight)
     {
         NONCLIENTMETRICSW metrics{};
         metrics.cbSize = sizeof(metrics);
@@ -255,7 +297,12 @@ namespace gui::detail
         {
             ok = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0) != 0;
         }
-        return ok ? CreateFontIndirectW(&metrics.lfMessageFont) : nullptr;
+        if (!ok)
+        {
+            return nullptr;
+        }
+        metrics.lfMessageFont.lfWeight = weight;   // 标题行走半粗体（FW_SEMIBOLD）
+        return CreateFontIndirectW(&metrics.lfMessageFont);
     }
 
     void apply_ui_font()
@@ -264,9 +311,12 @@ namespace gui::detail
         {
             return;
         }
-        SendMessageW(ui().path_label, WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);
-        SendMessageW(ui().list, WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);
-        SendMessageW(ui().status, WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);
+        SendMessageW(ui().headline, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(ui().headline_font != nullptr ? ui().headline_font : ui().font), TRUE);
+        for (HWND control : { ui().subline, ui().list, ui().status, ui().empty_hint })
+        {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);
+        }
         for (int i = 0; i < BUTTON_COUNT; ++i)
         {
             SendMessageW(ui().buttons[i], WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);

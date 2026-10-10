@@ -53,9 +53,22 @@ namespace gui::detail
             ui().post_target.store(hwnd);
             ui().dpi = window_dpi(hwnd);
             ui().font = create_ui_font(ui().dpi);
+            ui().headline_font = create_ui_font(ui().dpi, FW_SEMIBOLD);
 
-            ui().path_label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                           0, 0, 0, 0, hwnd, control_id(IDC_PATH_LABEL), ui().instance, nullptr);
+            // 头部三件套：图标（exe 资源里就有 32px 那档）+ 半粗标题 + 灰色副标题
+            ui().header_icon = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+                                            0, 0, 0, 0, hwnd, control_id(IDC_HEADER_ICON), ui().instance, nullptr);
+            ui().headline = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                                            0, 0, 0, 0, hwnd, control_id(IDC_HEADLINE), ui().instance, nullptr);
+            ui().header_icon_handle = reinterpret_cast<HICON>(LoadImageW(ui().instance, MAKEINTRESOURCEW(101),
+                                                                        IMAGE_ICON, scale(32), scale(32), LR_DEFAULTCOLOR));
+            if (ui().header_icon_handle != nullptr)
+            {
+                SendMessageW(ui().header_icon, STM_SETICON, reinterpret_cast<WPARAM>(ui().header_icon_handle), 0);
+            }
+
+            ui().subline = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                                           0, 0, 0, 0, hwnd, control_id(IDC_SUBLINE), ui().instance, nullptr);
 
             ui().list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
@@ -75,6 +88,11 @@ namespace gui::detail
                 init_icons();
             }
 
+            // 空态提示：贴在列表区域中央（在列表之后创建 → 位于列表上层；拖放照常能接）
+            ui().empty_hint = CreateWindowExW(0, L"STATIC", L"把文件或文件夹拖到这里\n或按 Ctrl+O 选择文件",
+                                             WS_CHILD | SS_CENTER | SS_NOPREFIX,
+                                             0, 0, 0, 0, hwnd, control_id(IDC_EMPTY_HINT), ui().instance, nullptr);
+
             for (int i = 0; i < BUTTON_COUNT; ++i)
             {
                 ui().buttons[i] = CreateWindowExW(0, L"BUTTON", kButtonSpec[i].text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -92,7 +110,7 @@ namespace gui::detail
             // 提权模式下这些窗口也要能收到资源管理器的拖放（见 allow_unelevated_drop 的说明）
             allow_unelevated_drop(hwnd);
             DragAcceptFiles(hwnd, TRUE);
-            for (HWND child : { ui().list, ui().path_label, ui().status })
+            for (HWND child : { ui().list, ui().headline, ui().subline, ui().header_icon, ui().empty_hint, ui().status })
             {
                 SetWindowSubclass(child, drop_subclass_proc, DROP_SUBCLASS_ID, 0);
                 allow_unelevated_drop(child);
@@ -104,7 +122,8 @@ namespace gui::detail
                 allow_unelevated_drop(ui().buttons[i]);
                 DragAcceptFiles(ui().buttons[i], TRUE);
             }
-            update_path_label();
+            update_header();
+            update_empty_hint();
             layout(hwnd);
             return 0;
 
@@ -135,7 +154,13 @@ namespace gui::detail
                 DeleteObject(ui().font);
                 ui().font = nullptr;
             }
+            if (ui().headline_font != nullptr)
+            {
+                DeleteObject(ui().headline_font);
+                ui().headline_font = nullptr;
+            }
             ui().font = create_ui_font(ui().dpi);
+            ui().headline_font = create_ui_font(ui().dpi, FW_SEMIBOLD);
             apply_ui_font();
 
             const RECT* suggested = reinterpret_cast<const RECT*>(l_param);
@@ -256,16 +281,15 @@ namespace gui::detail
 
         case WM_CTLCOLORSTATIC:
         {
-            // 路径标签在"还没检查任何东西"时是引导文案，用灰色弱化；有内容时用正常文字色
+            // 所有 STATIC 统一"透明背景 + 窗口底色"：默认会画 COLOR_3DFACE，在白底上留灰带。
+            // 副标题（未检查时的引导语）与空态提示用灰色弱化，其余用正文色。
+            auto dc = reinterpret_cast<HDC>(w_param);
             auto control = reinterpret_cast<HWND>(l_param);
-            if (control == ui().path_label && ui().paths.empty())
-            {
-                auto dc = reinterpret_cast<HDC>(w_param);
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
-                return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
-            }
-            break;
+            const bool muted = control == ui().empty_hint ||
+                               (control == ui().subline && ui().paths.empty());
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, GetSysColor(muted ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
         }
 
         case WM_INITMENUPOPUP:
@@ -448,6 +472,16 @@ namespace gui::detail
             {
                 DeleteObject(ui().font);
                 ui().font = nullptr;
+            }
+            if (ui().headline_font)
+            {
+                DeleteObject(ui().headline_font);
+                ui().headline_font = nullptr;
+            }
+            if (ui().header_icon_handle)
+            {
+                DestroyIcon(ui().header_icon_handle);
+                ui().header_icon_handle = nullptr;
             }
             ui().post_target.store(nullptr);
             ui().window = nullptr;

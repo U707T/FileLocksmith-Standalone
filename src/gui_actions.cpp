@@ -174,7 +174,7 @@ namespace gui::detail
                        + (remaining.empty() ? L"。" : L"，还有 " + std::to_wstring(remaining.size()) + L" 个没删掉。"));
         }
 
-        update_path_label();
+        update_header();
         if (ui().paths.empty())
         {
             ui().results.clear();

@@ -28,10 +28,13 @@ namespace gui::detail
     constexpr int IDC_KILL_ALL = 1003;
     constexpr int IDC_REFRESH = 1004;
     constexpr int IDC_OPEN_LOCATION = 1006;
-    constexpr int IDC_PATH_LABEL = 1007;
+    constexpr int IDC_SUBLINE = 1007;
     constexpr int IDC_STATUS = 1008;
     constexpr int IDC_FORCE_UNLOCK = 1009;
     constexpr int IDC_DELETE_FILES = 1010;
+    constexpr int IDC_HEADER_ICON = 1012;
+    constexpr int IDC_HEADLINE = 1013;
+    constexpr int IDC_EMPTY_HINT = 1014;
     constexpr int IDM_TOGGLE_CONTEXT_MENU = 2001;
     constexpr int IDM_INSTALL_SENDTO = 2002;
     constexpr int IDM_OPEN_SENDTO = 2003;
@@ -81,7 +84,7 @@ namespace gui::detail
     void update_button_states();
     int icon_index_for(const std::wstring& path);
     std::vector<int> selected_rows();
-    void update_path_label();
+    void update_header();
     struct SearchPayload
     {
         LocksmithResult locks;
@@ -101,10 +104,15 @@ namespace gui::detail
         HWND window = nullptr;
         HWND list = nullptr;
         HWND status = nullptr;
-        HWND path_label = nullptr;
+        HWND subline = nullptr;
+        HWND header_icon = nullptr;
+        HWND headline = nullptr;
+        HWND empty_hint = nullptr;
         HWND tooltip = nullptr;
         HWND buttons [BUTTON_COUNT] = {};
         HFONT font = nullptr;
+        HFONT headline_font = nullptr;
+        HICON header_icon_handle = nullptr;
         HMENU main_menu = nullptr;
         HMENU tools_menu = nullptr;
         UINT dpi = 96;
@@ -147,6 +155,8 @@ namespace gui::detail
     HWND button_by_id(int id);
     void init_list_extras();
     void init_tooltips(HWND parent);
+    // 列表为空时的居中提示（贴在列表区域里，拖放同样能接）
+    void update_empty_hint();
     void build_menu(HWND hwnd);
     // 控件 ID 通过 CreateWindowExW 的 HMENU 参数传递；经 INT_PTR 中转以满足 64 位 MSVC（C4312）
     inline HMENU control_id(int id)
@@ -155,7 +165,7 @@ namespace gui::detail
     }
     void copy_selected(bool exe_path, bool pid_only, bool whole_row);
     void copy_to_clipboard(const std::wstring& text);
-    HFONT create_ui_font(UINT dpi);
+    HFONT create_ui_font(UINT dpi, LONG weight = FW_NORMAL);
     void delete_checked_paths();
     std::wstring describe_paths_for_dialog();
     LRESULT CALLBACK drop_subclass_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data);
@@ -187,7 +197,7 @@ namespace gui::detail
     void toggle_context_menu();
     void update_button_states();
     void update_menu_state();
-    void update_path_label();
+    void update_header();
     UINT window_dpi(HWND hwnd);
     LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param);
 }
