@@ -6,11 +6,15 @@ on:
       - main
     paths-ignore:
       - README.md
+      - README.en.md
+      - docs/**
       - LICENSE
       - LICENSE-PowerToys-MIT.txt
   pull_request:
     paths-ignore:
       - README.md
+      - README.en.md
+      - docs/**
       - LICENSE
       - LICENSE-PowerToys-MIT.txt
   workflow_dispatch:
