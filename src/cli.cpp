@@ -35,6 +35,7 @@ namespace
         text += L"  --unregister       移除右键菜单项\n";
         text += L"  --sendto           加到「发送到」菜单（Win11 一级右键菜单可见）\n";
         text += L"  --delete           删除这些路径（进回收站；被占用时先解除占用再重试）\n";
+        text += L"  --no-unlock        配合 --delete：不要自动强制关闭占用者的句柄，失败就失败\n";
         text += L"  --delete-reboot    安排重启后删除（不进回收站，需要管理员）\n";
         text += L"  --version          显示版本\n";
         text += L"  -h, --help         显示本帮助\n";
@@ -197,7 +198,7 @@ namespace
     bool is_cli_flag(const std::wstring& arg)
     {
         return arg == L"--json" || arg == L"--kill" || arg == L"--unlock" || arg == L"--wait" || arg == L"--timeout" ||
-               arg == L"--sendto" || arg == L"--delete" || arg == L"--delete-reboot" ||
+               arg == L"--sendto" || arg == L"--delete" || arg == L"--delete-reboot" || arg == L"--no-unlock" ||
                arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
                arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
     }
@@ -227,6 +228,7 @@ int cli_main(const std::vector<std::wstring>& args)
     bool elevate = false;
     bool delete_files = false;
     bool delete_reboot = false;
+    bool no_unlock = false;
     int timeout_ms = -1;
     std::vector<std::wstring> paths;
 
@@ -260,6 +262,10 @@ int cli_main(const std::vector<std::wstring>& args)
         else if (arg == L"--delete-reboot")
         {
             delete_reboot = true;
+        }
+        else if (arg == L"--no-unlock")
+        {
+            no_unlock = true;
         }
         else if (arg == L"--timeout")
         {
@@ -580,8 +586,20 @@ int cli_main(const std::vector<std::wstring>& args)
             else
             {
                 const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
-                if (lock_like && !locks.handles.empty())
+                if (lock_like && no_unlock)
                 {
+                    note(L"（--no-unlock：不会替你去关占用者的句柄）\n");
+                }
+                else if (lock_like && !locks.handles.empty())
+                {
+                    // 强制关别人的句柄是有影响的：先把占用者列出来，别让它悄悄发生
+                    std::wstring holders;
+                    for (const auto& process : results)
+                    {
+                        holders += L"  " + process.name + L" (PID " + std::to_wstring(process.pid) + L")\n";
+                    }
+                    note(L"占用者：\n" + holders);
+
                     std::vector<std::wstring> failures;
                     const auto closed = release_handles(locks.handles, failures);
                     note(L"删除失败（" + error + L"），已强制关闭 " + std::to_wstring(closed) + L" 个句柄，重试…\n");

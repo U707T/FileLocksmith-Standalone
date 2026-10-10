@@ -89,8 +89,13 @@ FileLocksmith-Standalone/
 - 直接双击 `FileLocksmith.exe`；把文件/文件夹**拖进窗口**或**拖到 exe 图标上**；
 - **拖入应用快捷方式（.lnk）或 exe**：自动解析出目标程序，把它的**整棵进程树**（主进程 + 子进程 + 孙进程）
   列出来，`全部结束` 一次收干净 —— 适合 Chrome / VS Code 这种一主多子的程序；
-- `删除文件` 按钮（含二次确认）：先直接删（进回收站），被占用时自动解除占用再重试，
-  仍失败会问你要不要安排「重启后删除」；
+- `删除文件` 按钮 —— **最多三道确认**：
+  1. 确认删除：逐条列出路径（文件夹会标注"里面的内容会一起删除"），说明进回收站、
+     以及"该驱动器禁用回收站时会变成永久删除"；
+  2. 若因占用失败 → 单独确认"是否强制关闭占用者的句柄"，**列出将被影响的进程**并写明风险
+     （可能报错/崩溃/丢数据，且不会结束进程），不想动它们可以改走「结束进程」；
+  3. 仍失败 → 再问一次"是否安排重启后删除"，点明不可还原；
+
 - **菜单栏「文件」里一键开关资源管理器右键菜单**（勾选项的状态就是当前状态），
   还能添加「发送到」入口、打开「发送到」文件夹、用对话框**添加文件…（Ctrl+O）/ 添加文件夹…**；
 - 列表里选中进程 → `结束进程`；`全部结束` 一键清理；`强制解锁` → 关句柄不杀进程（见第 5 节）；
@@ -105,6 +110,7 @@ FileLocksmith.exe report.docx --json        # JSON 输出（方便脚本处理�
 FileLocksmith.exe report.docx --unlock      # 强制解除占用（关句柄，不结束进程）
 FileLocksmith.exe app.lnk --kill            # 拖动快捷方式：结束该程序的整棵进程树
 FileLocksmith.exe report.docx --delete      # 删除文件（进回收站；被占用时先解除占用再删）
+FileLocksmith.exe report.docx --delete --no-unlock  # 同上，但绝不自动去关占用者的句柄
 FileLocksmith.exe locked.sys --delete-reboot # 安排重启后删除（需要管理员）
 FileLocksmith.exe C:\build --kill           # 结束所有占用该目录的进程
 FileLocksmith.exe setup.exe --wait --timeout 60000   # 等文件解锁，最多 60 秒

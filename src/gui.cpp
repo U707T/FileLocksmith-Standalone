@@ -671,18 +671,50 @@ namespace
         const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
         if (!already_released_handles && lock_like && !g_handles.empty())
         {
+            // 第 2 道确认：强制关别人的句柄会影响别的程序，不能替用户点头
+            std::wstring holders;
+            size_t shown = 0;
+            for (const auto& process : g_results)
+            {
+                if (shown >= 8)
+                {
+                    holders += L"  …还有其它进程\n";
+                    break;
+                }
+                holders += L"  " + process.name + L" (PID " + std::to_wstring(process.pid) + L")\n";
+                ++shown;
+            }
+
+            const std::wstring question =
+                L"删除失败：" + error + L"\n\n"
+                L"要强制关闭占用者的文件句柄后再删一次吗？\n\n"
+                L"将关闭 " + std::to_wstring(g_handles.size()) + L" 个句柄，涉及下面这些进程：\n" + holders +
+                L"\n⚠ 风险：这相当于不结束程序就直接拔 U 盘 —— 它们之后可能报错、崩溃，\n"
+                L"   或者丢掉未保存的数据。这一步不会结束任何进程。\n\n"
+                L"如果不想动它们，点「否」，改用「结束进程」或「全部结束」。";
+
+            if (MessageBoxW(g_window, question.c_str(), L"删除文件 — 需要强制解除占用", MB_YESNO | MB_ICONEXCLAMATION) != IDYES)
+            {
+                set_status(L"已取消删除（文件仍被占用）：" + error);
+                return;
+            }
+
             std::vector<std::wstring> failures;
             const auto closed = release_handles(g_handles, failures);
-            set_status(L"删除失败（" + error + L"），已强制关闭 " + std::to_wstring(closed) + L" 个句柄，正在重试…");
+            set_status(L"已强制关闭 " + std::to_wstring(closed) + L" 个句柄，正在重试删除…");
             run_delete(true);
             return;
         }
 
-        std::wstring question = L"删除失败：" + error + L"\n\n要不要安排「重启后删除」？\n\n"
-                                L"• 会写进系统的 PendingFileRenameOperations，重启后自动删除\n"
-                                L"• 不进回收站（无法还原）\n"
-                                L"• 需要管理员权限";
-        if (MessageBoxW(g_window, question.c_str(), L"重启后删除", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        // 第 3 道确认：这一步不可还原，措辞要更重
+        const std::wstring question =
+            L"删除失败：" + error + L"\n\n"
+            L"要不要安排「重启后删除」？\n\n"
+            L"• 会写进系统的 PendingFileRenameOperations，重启时自动删除\n"
+            L"• 不进回收站 —— 删掉就找不回来了\n"
+            L"• 需要管理员权限，而且重启之前文件仍然在";
+
+        if (MessageBoxW(g_window, question.c_str(), L"删除文件 — 重启后删除（不可还原）", MB_YESNO | MB_ICONWARNING) != IDYES)
         {
             set_status(L"删除已取消：" + error);
             return;
@@ -700,6 +732,31 @@ namespace
         }
     }
 
+    // 对话框里逐条列出要删的路径；文件夹必须标出来（删文件夹 = 连里面的东西一起删）
+    std::wstring describe_paths_for_dialog()
+    {
+        constexpr size_t max_shown = 10;
+        std::wstring text;
+        const size_t count = std::min(g_paths.size(), max_shown);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto& path = g_paths[i];
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            const bool is_directory = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            text += L"  " + path + L"\n";
+            if (is_directory)
+            {
+                text += L"      ↑ 文件夹：里面的内容会一起删除\n";
+            }
+        }
+        if (g_paths.size() > count)
+        {
+            text += L"  …以及另外 " + std::to_wstring(g_paths.size() - count) + L" 个路径\n";
+        }
+        return text;
+    }
+
+    // 第 1 道确认：删什么、删到哪去
     void delete_checked_paths()
     {
         if (g_paths.empty())
@@ -708,18 +765,16 @@ namespace
             return;
         }
 
-        std::wstring list;
-        for (const auto& path : g_paths)
-        {
-            list += L"  " + path + L"\n";
-        }
+        const std::wstring question =
+            L"确定要删除下面 " + std::to_wstring(g_paths.size()) + L" 个路径吗？\n\n" +
+            describe_paths_for_dialog() +
+            L"\n删除后它们会进入回收站，可以从回收站还原。\n"
+            L"（如果该驱动器禁用了回收站，则会变成永久删除）\n\n"
+            L"若文件正被程序占用，下一步会单独问你一次 —— 那一步才会去动别人的句柄。";
 
-        std::wstring question = L"确定要删除下面 " + std::to_wstring(g_paths.size()) + L" 个路径吗？\n\n" + list +
-                                L"\n• 会放进回收站（可以还原）\n"
-                                L"• 如果被占用，会先尝试强制解除占用再删除\n"
-                                L"• 仍然失败时会询问你要不要安排「重启后删除」";
-        if (MessageBoxW(g_window, question.c_str(), L"删除文件", MB_YESNO | MB_ICONWARNING) != IDYES)
+        if (MessageBoxW(g_window, question.c_str(), L"删除文件 — 确认删除", MB_YESNO | MB_ICONWARNING) != IDYES)
         {
+            set_status(L"已取消删除。");
             return;
         }
 

@@ -217,6 +217,23 @@ elseif ($stillThere) { Write-Bad "被占用的文件没删掉" }
 elseif (-not $lockerAlive) { Write-Bad "占用进程被杀了，--delete 只应该关句柄" }
 else { Write-Ok "被占用的文件已删除（进回收站），占用进程仍在运行" }
 
+# --- 用例 11：--no-unlock 时不替用户去关别人的句柄 ---
+Write-Case "用例 11 / --delete --no-unlock 不碰别人的句柄"
+$victim2 = Join-Path $dir 'no-unlock.txt'
+Set-Content -Path $victim2 -Value 'bye'
+$locker5 = Start-Locker $victim2
+Start-Sleep -Seconds 5
+$rNo = Invoke-FL @($victim2, '--delete', '--no-unlock', '--cli')
+Write-Host "  stdout: $($rNo.StdOut.Trim())"
+$stillThere2 = Test-Path -LiteralPath $victim2
+$locker5Alive = -not $locker5.HasExited
+Stop-Process -Id $locker5.Id -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $victim2 -Force -ErrorAction SilentlyContinue
+if ($rNo.ExitCode -eq 0) { Write-Bad "--no-unlock 下被占用应该删除失败" }
+elseif (-not $stillThere2) { Write-Bad "文件被删了，说明还是动了别人的句柄" }
+elseif (-not $locker5Alive) { Write-Bad "占用进程被结束了" }
+else { Write-Ok "--no-unlock 下不动别人的句柄，失败即失败" }
+
 # --- 汇总 ---
 Write-Host "`n================ 结果 ================" -ForegroundColor Cyan
 Write-Host "通过 $script:Passed 项，失败 $script:Failed 项"
