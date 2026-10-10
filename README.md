@@ -71,8 +71,9 @@ FileLocksmith-Standalone/
 │   ├── file_locksmith.{h,cpp}  # find_processes_recursive（原样）
 │   ├── process_result.h        # 结果结构（原样）
 │   ├── app_utils.{h,cpp}       # 控制台/提权/结束进程等 Win32 工具
-│   ├── cli.{h,cpp}             # 命令行模式 + 注册表右键菜单注册
+│   ├── cli.{h,cpp}             # 命令行模式
 │   ├── gui.{h,cpp}             # Win32 图形界面（新增，替代 WinUI 3）
+│   ├── shell_integration.{h,cpp} # 资源管理器集成：右键菜单注册 / 「发送到」快捷方式（CLI 与 GUI 共用）
 │   └── main.cpp                # 入口：自动决定命令行还是图形界面
 └── dist/FileLocksmith.exe      # 本地构建产物（被 .gitignore 忽略，仓库不放二进制）
 ```
@@ -86,8 +87,11 @@ FileLocksmith-Standalone/
 
 ### 图形界面
 - 直接双击 `FileLocksmith.exe`；把文件/文件夹**拖进窗口**或**拖到 exe 图标上**；
+- **菜单栏「文件」里一键开关资源管理器右键菜单**（勾选项的状态就是当前状态），
+  还能添加「发送到」入口、打开「发送到」文件夹；
 - 列表里选中进程 → `结束进程`；`全部结束` 一键清理；`强制解锁` → 关句柄不杀进程（见第 5 节）；
-  双击某行 → 在资源管理器中定位该文件；
+  双击某行 → 在资源管理器中定位该文件；`F5` 重新检查；「帮助 → 关于」里能看到系统版本、
+  是否管理员、右键菜单与「发送到」的当前状态；
 - 权限不够（系统进程看不到/杀不掉）时点 `以管理员身份重启`。
 
 ### 命令行
@@ -100,11 +104,18 @@ FileLocksmith.exe setup.exe --wait --timeout 60000   # 等文件解锁，最多 
 FileLocksmith.exe --elevate report.docx     # 提权后重开
 FileLocksmith.exe --register                # 添加右键菜单项（仅当前用户 HKCU）
 FileLocksmith.exe --unregister              # 移除右键菜单项
+FileLocksmith.exe --sendto                  # 加到「发送到」菜单（Win11 一级菜单可见）
 ```
 
 **模式是怎么决定的**：带任一 CLI 开关，或者父进程有控制台（即在 cmd/PowerShell 里运行）
 → 命令行模式；否则（双击、右键"打开方式"、右键菜单）→ 图形界面。
 所以从资源管理器启动永远不会闪黑框。
+
+JSON 输出长这样（`unresolved` 是"打不开、没被检查"的路径，脚本可以直接判定）：
+
+```json
+{"processes":[{"pid":1234,"name":"foo.exe","user":"me","files":["C:\\x\\y.txt"]}],"unresolved":[]}
+```
 
 > ⚠️ **PowerShell 用户注意**：这个 exe 是 Windows 子系统（为了双击不闪黑框），
 > PowerShell 7 会把它判定为图形程序 —— `& .\FileLocksmith.exe f.txt --json` 这种写法
@@ -199,8 +210,17 @@ cmake --build build -j
 
 ## 8. 关于右键菜单（和原版的最大差别）
 
-- `--register` 写的是 `HKCU\Software\Classes\*\shell\FileLocksmith`（传统 verb）。
-  Windows 10 直接可见；**Windows 11 需要点"显示更多选项"（Shift+F10）**才会出现在经典菜单里。
+**怎么开、怎么关**：打开 exe → 菜单栏「**文件 → 添加到资源管理器右键菜单**」，勾选状态就是当前状态；
+再点一次就是关闭。命令行对应 `--register` / `--unregister`。
+另外「文件 → 添加到「发送到」菜单」会在 `%APPDATA%\Microsoft\Windows\SendTo` 放一个快捷方式 ——
+Win11 的「发送到」在**一级菜单**里，比传统 verb 少点一步。
+
+- 写入的是 `HKCU\Software\Classes\...`（传统 verb），**只影响当前用户、不需要管理员**：
+  - `*\shell\FileLocksmith` —— 任意文件
+  - `Directory\shell\FileLocksmith` —— 文件夹
+  - `Drive\shell\FileLocksmith` —— 驱动器
+  - `Directory\Background\shell\FileLocksmith` —— 目录空白处（命令用 `%V` 取当前目录）
+- Windows 10 直接可见；**Windows 11 需要点"显示更多选项"（Shift+F10）**才会出现在经典菜单里。
 - PowerToys 原版能出现在 Win11 **一级菜单**，靠的是 `IExplorerCommand` + **稀疏 MSIX 包**
   （`FileLocksmithContextMenu/AppxManifest.xml`）。那条路的代价是：
   必须打包签名、必须安装包、必须部署外壳扩展 DLL——一个裸 exe 做不到，
@@ -227,8 +247,9 @@ cmake --build build -j
    结果会偏少。程序启动时会尝试开启 `SeDebugPrivilege`，但不是万能药；界面上有"以管理员身份重启"。
 2. **`TerminateThread` 是有意为之**：见第 2 节。它是"不安全的"API，但在 `NtQueryObject` 卡死时
    没有别的办法，原版 PowerToys 就是这么做的。
-3. **枚举有开销**：每次查询都要遍历全系统句柄表，机械盘/句柄多的机器上可能几秒。
-   GUI 里这个工作放在后台线程，不会卡界面。
+3. **枚举有开销**：每次查询要遍历全系统句柄表，**并且为了查出"被当成 DLL/EXE 加载"的情况，
+   还会对每个进程枚举模块**（`EnumProcessModules` + 逐个取模块路径）。进程多、模块多的机器上可能几秒，
+   这是当前最值得优化的地方（GUI 里放在后台线程，不会卡界面）。
 4. **结束进程 = `TerminateProcess`**：没有"保存数据"的优雅退出，界面上有二次确认。
    「强制解锁」同样有副作用（关别人的句柄），见第 5 节。
 5. **图形界面没有自动化测试**：CI 只覆盖命令行与核心逻辑（真机端到端），

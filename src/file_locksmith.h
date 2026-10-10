@@ -20,6 +20,9 @@ struct LocksmithResult
     // 枚举是否成功。false 表示"查不到"，而不是"没有占用" —— 调用方必须区别对待。
     bool handles_query_ok = false;
     bool processes_query_ok = false;
+    // 传进来但没法解析的路径（不存在 / 没权限 / 不是本地磁盘上的对象）。
+    // 这些路径不可能匹配到任何句柄，必须单独报出来，否则用户会以为"没有占用"。
+    std::vector<std::wstring> unresolved_paths;
 };
 
 // Second version, checks handles towards files and all subfiles and folders of given dirs, if any.

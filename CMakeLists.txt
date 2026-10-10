@@ -23,6 +23,7 @@ add_executable(FileLocksmith WIN32
     src/app_utils.cpp
     src/cli.cpp
     src/gui.cpp
+    src/shell_integration.cpp
     src/file_locksmith.cpp
     src/ntdll_base.cpp
     src/ntdll_extensions.cpp
@@ -31,7 +32,7 @@ add_executable(FileLocksmith WIN32
 
 target_compile_definitions(FileLocksmith PRIVATE UNICODE _UNICODE)
 target_include_directories(FileLocksmith PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(FileLocksmith PRIVATE kernel32 user32 gdi32 shell32 advapi32 comctl32 psapi)
+target_link_libraries(FileLocksmith PRIVATE kernel32 user32 gdi32 shell32 advapi32 comctl32 psapi ole32)
 
 if (MSVC)
     # Static CRT (/MT): the shipped exe must not need the VC++ redistributable.

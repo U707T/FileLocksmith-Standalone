@@ -4,31 +4,36 @@
 
 namespace
 {
-    std::wstring_view unicode_to_view(UNICODE_STRING unicode_str)
-    {
-        return std::wstring_view(unicode_str.Buffer, unicode_str.Length / sizeof(WCHAR));
-    }
-
     std::wstring unicode_to_str(UNICODE_STRING unicode_str)
     {
         return std::wstring(unicode_str.Buffer, unicode_str.Length / sizeof(WCHAR));
     }
 
+    // 只返回"这个进程里的这个模块"的路径。
+    //
+    // 这里必须用 GetModuleFileNameExW 重试放大缓冲区：
+    //   * 原实现失败时会去调 GetModuleFileNameW(mod) —— mod 属于别的进程，
+    //     用本进程的 API 解释它，轻则拿不到名字，重则返回我们自己的同名模块路径（误报）；
+    //   * 原实现用未初始化的栈缓冲区构造字符串（wcslen(buffer)），
+    //     只要函数返回 0 且 GetLastError 不是 ERROR_INSUFFICIENT_BUFFER 就会把垃圾内存当路径。
     inline std::wstring get_module_name(HANDLE process, HMODULE mod)
     {
-        wchar_t buffer[MAX_PATH + 1];
-        DWORD actual_length = GetModuleFileNameExW(process, mod, buffer, MAX_PATH + 1);
-        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+        std::wstring buffer(MAX_PATH * 2, L'\0');
+        for (int attempt = 0; attempt < 4; ++attempt)
         {
-            const DWORD long_path_length = 0xFFFF; // should be always enough
-            std::wstring long_filename(long_path_length, L'\0');
-            actual_length = GetModuleFileNameW(mod, long_filename.data(), long_path_length);
-            long_filename.resize(std::wcslen(long_filename.data()));
-            long_filename.shrink_to_fit();
-            return long_filename;
+            const DWORD length = GetModuleFileNameExW(process, mod, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (length == 0)
+            {
+                return {};
+            }
+            if (length < buffer.size() - 1)
+            {
+                buffer.resize(length);
+                return buffer;
+            }
+            buffer.resize(buffer.size() * 4);
         }
-
-        return { buffer, static_cast<UINT>(wcslen(buffer)) };
+        return {};
     }
 
     constexpr size_t DefaultModulesResultSize = 512;
@@ -69,7 +74,11 @@ namespace
 
             for (auto mod : modules)
             {
-                result.push_back(get_module_name(process, mod));
+                auto name = get_module_name(process, mod);
+                if (!name.empty())
+                {
+                    result.push_back(std::move(name));
+                }
             }
 
             completed = true;

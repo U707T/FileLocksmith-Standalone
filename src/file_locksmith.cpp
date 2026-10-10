@@ -33,6 +33,11 @@ LocksmithResult find_locks(const std::vector<std::wstring>& paths)
         {
             (is_directory(path) ? kernel_names_dirs : kernel_names_files)[kernel_path] = path;
         }
+        else
+        {
+            // 打不开就永远匹配不到句柄，必须让调用方知道这个路径压根没被检查
+            result.unresolved_paths.push_back(path);
+        }
     }
 
     std::map<ULONG_PTR, std::set<std::wstring>> pid_files;

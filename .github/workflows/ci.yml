@@ -172,6 +172,38 @@ jobs:
           Stop-Process -Id $blocker2.Id -Force -ErrorAction SilentlyContinue
           if ($stillLocked) { throw "用例 4 失败：句柄关掉了，但文件仍打不开" }
           Write-Host "用例 4 通过：文件已解锁，而进程 $($blocker2.Id) 仍然活着"
+
+          # --- 用例 5：右键菜单的开启 / 关闭（HKCU，无需管理员）---
+          $menuKey = 'HKCU:\Software\Classes\*\shell\FileLocksmith'
+          $r6 = Invoke-FL @('--register', '--cli')
+          Write-Host "  --register stdout: $($r6.StdOut.Trim())"
+          if ($r6.ExitCode -ne 0) { throw "用例 5 失败：--register 退出码 $($r6.ExitCode)" }
+          if (-not (Test-Path $menuKey)) { throw "用例 5 失败：注册后 $menuKey 不存在" }
+          $command = (Get-Item "$menuKey\command").GetValue('')
+          Write-Host "  注册的命令: $command"
+          if ($command -notmatch [regex]::Escape('FileLocksmith-x64.exe')) { throw "用例 5 失败：命令没指向本 exe" }
+          if (-not (Test-Path 'HKCU:\Software\Classes\Directory\shell\FileLocksmith')) { throw "用例 5 失败：文件夹右键没注册" }
+          if (-not (Test-Path 'HKCU:\Software\Classes\Directory\Background\shell\FileLocksmith')) { throw "用例 5 失败：目录空白处右键没注册" }
+          $r7 = Invoke-FL @('--unregister', '--cli')
+          if (Test-Path $menuKey) { throw "用例 5 失败：--unregister 之后注册表项还在" }
+          Write-Host "用例 5 通过：右键菜单可以开启 / 关闭，命令指向正确的 exe"
+
+          # --- 用例 6：「发送到」快捷方式（走 IShellLink COM 那条路）---
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\SendTo\FileLocksmith.lnk'
+          $r8 = Invoke-FL @('--sendto', '--cli')
+          Write-Host "  --sendto stdout: $($r8.StdOut.Trim())"
+          if ($r8.ExitCode -ne 0) { throw "用例 6 失败：--sendto 退出码 $($r8.ExitCode)" }
+          if (-not (Test-Path $lnk)) { throw "用例 6 失败：快捷方式没创建出来" }
+          Remove-Item $lnk -Force -ErrorAction SilentlyContinue
+          Write-Host "用例 6 通过：已创建并清理「发送到」快捷方式"
+
+          # --- 用例 7：打不开的路径不能被当成"没有占用" ---
+          $ghost = Join-Path $env:RUNNER_TEMP 'fl-test\does-not-exist.txt'
+          $r9 = Invoke-FL @($ghost, '--json', '--cli')
+          Write-Host "  stdout: $($r9.StdOut.Trim())"
+          if ($r9.StdOut -notmatch '"unresolved"') { throw "用例 7 失败：JSON 里没有 unresolved 字段" }
+          if ($r9.StdOut -notmatch 'does-not-exist') { throw "用例 7 失败：没有报出无效路径" }
+          Write-Host "用例 7 通过：无效路径会被明确报出"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

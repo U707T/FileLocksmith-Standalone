@@ -3,6 +3,7 @@
 #include "cli.h"
 #include "app_utils.h"
 #include "file_locksmith.h"
+#include "shell_integration.h"
 
 #include <version.h>
 
@@ -32,6 +33,7 @@ namespace
         text += L"  --elevate          以管理员身份重新启动\n";
         text += L"  --register         添加右键菜单项（仅当前用户）\n";
         text += L"  --unregister       移除右键菜单项\n";
+        text += L"  --sendto           加到「发送到」菜单（Win11 一级右键菜单可见）\n";
         text += L"  --version          显示版本\n";
         text += L"  -h, --help         显示本帮助\n";
         return text;
@@ -71,7 +73,7 @@ namespace
         return result;
     }
 
-    std::wstring to_json(const std::vector<ProcessResult>& results)
+    std::wstring to_json(const std::vector<ProcessResult>& results, const std::vector<std::wstring>& unresolved)
     {
         std::wstring out = L"{\"processes\":[";
         bool first_process = true;
@@ -99,15 +101,28 @@ namespace
             }
             out += L"]}";
         }
+        out += L"],\"unresolved\":[";
+        bool first_unresolved = true;
+        for (const auto& path : unresolved)
+        {
+            if (!first_unresolved)
+            {
+                out += L',';
+            }
+            first_unresolved = false;
+            out += L"\"" + json_escape(path) + L"\"";
+        }
         out += L"]}";
         return out;
     }
 
-    std::wstring to_text(const std::vector<ProcessResult>& results)
+    std::wstring to_text(const std::vector<ProcessResult>& results, bool any_path_checked)
     {
         if (results.empty())
         {
-            return L"没有找到占用该文件的进程。\n";
+            // 一个路径都没查成功的时候，说"没有占用"是误导
+            return any_path_checked ? L"没有找到占用该文件的进程。\n"
+                                    : L"没有任何路径被成功检查（见上面的警告）。\n";
         }
 
         std::wstring out = L"PID\t用户\t进程\n";
@@ -137,64 +152,50 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    //  Shell integration
+    //  资源管理器集成（实现见 shell_integration.cpp，GUI 走同一套）
     // ------------------------------------------------------------------
-    constexpr wchar_t ContextMenuKey[] = L"Software\\Classes\\*\\shell\\FileLocksmith";
-    constexpr wchar_t ContextMenuKeyDir[] = L"Software\\Classes\\Directory\\shell\\FileLocksmith";
-    constexpr wchar_t ContextMenuVerb[] = L"什么正在占用这个文件？";
-
-    bool set_reg_string(HKEY root, const std::wstring& sub_key, const wchar_t* name, const std::wstring& value)
-    {
-        HKEY key = nullptr;
-        if (RegCreateKeyExW(root, sub_key.c_str(), 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
-        {
-            return false;
-        }
-        auto status = RegSetValueExW(key, name, 0, REG_SZ,
-                                     reinterpret_cast<const BYTE*>(value.c_str()),
-                                     static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
-        RegCloseKey(key);
-        return status == ERROR_SUCCESS;
-    }
-
-    bool delete_reg_tree(HKEY root, const std::wstring& sub_key)
-    {
-        return RegDeleteTreeW(root, sub_key.c_str()) == ERROR_SUCCESS;
-    }
-
     int register_context_menu()
     {
-        auto exe = app::executable_path();
-        auto command = app::quote_arg(exe) + L" \"%1\"";
-        auto icon = exe + L",0";
-
-        bool ok = true;
-        for (const auto* key : { ContextMenuKey, ContextMenuKeyDir })
+        if (!shell_integration::install_context_menu())
         {
-            std::wstring base(key);
-            ok = set_reg_string(HKEY_CURRENT_USER, base, nullptr, ContextMenuVerb) && ok;
-            ok = set_reg_string(HKEY_CURRENT_USER, base, L"Icon", icon) && ok;
-            ok = set_reg_string(HKEY_CURRENT_USER, base, L"MultiSelectModel", L"Player") && ok;
-            ok = set_reg_string(HKEY_CURRENT_USER, base + L"\\command", nullptr, command) && ok;
+            app::out(L"写入注册表失败。\n");
+            return 1;
         }
 
-        app::out(ok ? L"已添加右键菜单项（对文件和文件夹生效）。\n"
-                    L"提示: Windows 11 需在“显示更多选项”(Shift+F10) 中查看。\n"
-                  : L"写入注册表失败。\n");
-        return ok ? 0 : 1;
+        app::out(L"已添加右键菜单项（文件 / 文件夹 / 驱动器 / 目录空白处，仅当前用户）。\n"
+                 L"提示: Windows 11 要在“显示更多选项”(Shift+F10) 里查看；\n"
+                 L"      想出现在 Win11 一级菜单，可以再加 --sendto 装到「发送到」里。\n");
+        return 0;
     }
 
     int unregister_context_menu()
     {
-        delete_reg_tree(HKEY_CURRENT_USER, ContextMenuKey);
-        delete_reg_tree(HKEY_CURRENT_USER, ContextMenuKeyDir);
+        if (!shell_integration::uninstall_context_menu())
+        {
+            app::out(L"移除右键菜单项失败。\n");
+            return 1;
+        }
+
         app::out(L"已移除右键菜单项。\n");
+        return 0;
+    }
+
+    int install_sendto()
+    {
+        if (!shell_integration::install_sendto_shortcut())
+        {
+            app::out(L"创建「发送到」快捷方式失败。\n");
+            return 1;
+        }
+
+        app::out(L"已添加到「发送到」菜单: " + shell_integration::sendto_folder() + L"\n");
         return 0;
     }
 
     bool is_cli_flag(const std::wstring& arg)
     {
         return arg == L"--json" || arg == L"--kill" || arg == L"--unlock" || arg == L"--wait" || arg == L"--timeout" ||
+               arg == L"--sendto" ||
                arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
                arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
     }
@@ -285,6 +286,10 @@ int cli_main(const std::vector<std::wstring>& args)
         {
             return unregister_context_menu();
         }
+        else if (arg == L"--sendto")
+        {
+            return install_sendto();
+        }
         else if (arg == L"--cli" || arg == L"--gui")
         {
             // Handled by main().
@@ -335,19 +340,32 @@ int cli_main(const std::vector<std::wstring>& args)
         app::out(out);
 
         auto start_time = std::chrono::steady_clock::now();
+        bool first_pass = true;
         for (;;)
         {
-            std::vector<ProcessResult> results;
+            LocksmithResult locks;
             try
             {
-                results = find_processes_recursive(paths);
+                locks = find_locks(paths);
             }
             catch (const std::exception& ex)
             {
                 app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
                 return 1;
             }
-            if (results.empty())
+
+            // 打不开的路径永远等不到解锁，直接报错（否则会立刻打印"文件已解锁"）
+            if (first_pass && !locks.unresolved_paths.empty())
+            {
+                for (const auto& path : locks.unresolved_paths)
+                {
+                    app::out(L"错误: 打不开 " + path + L"（不存在 / 没权限）\n");
+                }
+                return 1;
+            }
+            first_pass = false;
+
+            if (locks.processes.empty())
             {
                 app::out(L"文件已解锁。\n");
                 return 0;
@@ -380,6 +398,16 @@ int cli_main(const std::vector<std::wstring>& args)
 
     std::vector<ProcessResult> results = locks.processes;
     std::wstring output;
+
+    if (!locks.unresolved_paths.empty())
+    {
+        output += L"警告: 下面 " + std::to_wstring(locks.unresolved_paths.size()) +
+                  L" 个路径打不开（不存在 / 没权限 / 不是本地对象），没有被检查:\n";
+        for (const auto& path : locks.unresolved_paths)
+        {
+            output += L"  ? " + path + L"\n";
+        }
+    }
 
     if (!locks.handles_query_ok)
     {
@@ -435,11 +463,11 @@ int cli_main(const std::vector<std::wstring>& args)
 
     if (json_output)
     {
-        output += to_json(results) + L"\n";
+        output += to_json(results, locks.unresolved_paths) + L"\n";
     }
     else
     {
-        output += to_text(results);
+        output += to_text(results, locks.unresolved_paths.size() < paths.size());
         if (!results.empty() && !app::is_process_elevated())
         {
             output += L"\n提示: 部分系统级进程需要管理员权限才能看到或结束，可使用 --elevate。\n";

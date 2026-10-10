@@ -3,8 +3,10 @@
 #include "gui.h"
 #include "app_utils.h"
 #include "file_locksmith.h"
+#include "shell_integration.h"
 
 #include <commctrl.h>
+#include <version.h>
 
 namespace
 {
@@ -20,6 +22,16 @@ namespace
     constexpr int IDC_PATH_LABEL = 1007;
     constexpr int IDC_STATUS = 1008;
     constexpr int IDC_FORCE_UNLOCK = 1009;
+
+    // 菜单命令（ID 从 2000 起，和控件 ID 分开）
+    constexpr int IDM_TOGGLE_CONTEXT_MENU = 2001;
+    constexpr int IDM_INSTALL_SENDTO = 2002;
+    constexpr int IDM_OPEN_SENDTO = 2003;
+    constexpr int IDM_REFRESH = 2004;
+    constexpr int IDM_ELEVATE = 2005;
+    constexpr int IDM_ABOUT = 2006;
+    constexpr int IDM_HOMEPAGE = 2007;
+    constexpr int IDM_EXIT = 2008;
 
     // 按钮：ID / 文字 / 宽度。以前是按 “IDC_KILL_SELECTED + 序号” 分配 ID 的，
     // 顺序和常量对不上，导致“打开所在位置”实际会触发“以管理员身份重启”，
@@ -51,6 +63,7 @@ namespace
     HWND g_path_label = nullptr;
     HWND g_buttons[BUTTON_COUNT] = {};
     HFONT g_font = nullptr;
+    HMENU g_main_menu = nullptr;
 
     bool g_searching = false;
     // Written by the UI thread, read by the worker thread that posts results.
@@ -203,6 +216,96 @@ namespace
         MoveWindow(g_status, margin, y + button_height + 2, client.right - 2 * margin, status_height, TRUE);
 
         resize_columns(client.right - 2 * margin);
+    }
+
+    void update_menu_state()
+    {
+        if (g_main_menu == nullptr)
+        {
+            return;
+        }
+        if (HMENU file_menu = GetSubMenu(g_main_menu, 0))
+        {
+            CheckMenuItem(file_menu, IDM_TOGGLE_CONTEXT_MENU,
+                          MF_BYCOMMAND | (shell_integration::is_context_menu_installed() ? MF_CHECKED : MF_UNCHECKED));
+        }
+    }
+
+    void build_menu(HWND hwnd)
+    {
+        HMENU menu = CreateMenu();
+        HMENU file_menu = CreatePopupMenu();
+        HMENU tools_menu = CreatePopupMenu();
+        HMENU help_menu = CreatePopupMenu();
+        if (menu == nullptr || file_menu == nullptr || tools_menu == nullptr || help_menu == nullptr)
+        {
+            return;
+        }
+
+        AppendMenuW(file_menu, MF_STRING, IDM_TOGGLE_CONTEXT_MENU, L"添加到资源管理器右键菜单(&C)");
+        AppendMenuW(file_menu, MF_STRING, IDM_INSTALL_SENDTO, L"添加到「发送到」菜单(&S)");
+        AppendMenuW(file_menu, MF_STRING, IDM_OPEN_SENDTO, L"打开「发送到」文件夹(&O)");
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"退出(&X)");
+
+        AppendMenuW(tools_menu, MF_STRING, IDM_REFRESH, L"重新检查(&R)\tF5");
+        AppendMenuW(tools_menu, MF_STRING, IDM_ELEVATE, L"以管理员身份重启(&A)");
+
+        AppendMenuW(help_menu, MF_STRING, IDM_ABOUT, L"关于 FileLocksmith(&A)");
+        AppendMenuW(help_menu, MF_STRING, IDM_HOMEPAGE, L"项目主页 (GitHub)(&H)");
+
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"文件(&F)");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools_menu), L"工具(&T)");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(help_menu), L"帮助(&H)");
+
+        SetMenu(hwnd, menu);
+        g_main_menu = menu;
+        update_menu_state();
+    }
+
+    void toggle_context_menu()
+    {
+        const bool was_installed = shell_integration::is_context_menu_installed();
+        const bool ok = was_installed ? shell_integration::uninstall_context_menu()
+                                      : shell_integration::install_context_menu();
+        update_menu_state();
+
+        if (!ok)
+        {
+            set_status(was_installed ? L"移除右键菜单失败。" : L"添加右键菜单失败（注册表写入被拒绝？）");
+            return;
+        }
+
+        set_status(was_installed
+                       ? L"已移除资源管理器右键菜单项。"
+                       : L"已添加右键菜单项（文件 / 文件夹 / 驱动器 / 目录空白处，仅当前用户）。"
+                         L"Windows 11 要进“显示更多选项”才看得到；想出现在一级菜单请用「文件 → 添加到「发送到」菜单」。");
+    }
+
+    void add_sendto_menu()
+    {
+        if (shell_integration::is_sendto_installed())
+        {
+            set_status(L"「发送到」里已经有 FileLocksmith 了");
+            return;
+        }
+
+        set_status(shell_integration::install_sendto_shortcut()
+                       ? L"已添加到「发送到」菜单（Win11 一级右键菜单里直接可见）。"
+                       : L"创建「发送到」快捷方式失败。");
+    }
+
+    void show_about()
+    {
+        const std::wstring text =
+            std::wstring(L"FileLocksmith ") + app::to_wstring(FL_VERSION_STRING) + L"\n"
+            L"由 PowerToys FileLocksmith 模块抽离的独立版本（MIT License）\n\n"
+            L"运行环境: " + app::os_friendly_name() + L" (" + app::os_version_string() + L")\n" +
+            std::wstring(L"管理员权限: ") + (app::is_process_elevated() ? L"是" : L"否") + L"\n" +
+            std::wstring(L"右键菜单: ") + (shell_integration::is_context_menu_installed() ? L"已添加" : L"未添加") + L"\n" +
+            std::wstring(L"「发送到」: ") + (shell_integration::is_sendto_installed() ? L"已添加" : L"未添加") + L"\n\n"
+            L"https://github.com/U707T/FileLocksmith-Standalone";
+        MessageBoxW(g_window, text.c_str(), L"关于 FileLocksmith", MB_OK | MB_ICONINFORMATION);
     }
 
     void start_search()
@@ -481,6 +584,7 @@ namespace
                 }
             }
 
+            build_menu(hwnd);
             DragAcceptFiles(hwnd, TRUE);
             update_path_label();
             layout(hwnd);
@@ -499,6 +603,23 @@ namespace
             case IDC_REFRESH: start_search(); return 0;
             case IDC_OPEN_LOCATION: open_file_location(); return 0;
             case IDC_ELEVATE: restart_elevated(); return 0;
+
+            case IDM_TOGGLE_CONTEXT_MENU: toggle_context_menu(); return 0;
+            case IDM_INSTALL_SENDTO: add_sendto_menu(); return 0;
+            case IDM_OPEN_SENDTO:
+                if (!shell_integration::open_sendto_folder())
+                {
+                    set_status(L"打不开「发送到」文件夹。");
+                }
+                return 0;
+            case IDM_REFRESH: start_search(); return 0;
+            case IDM_ELEVATE: restart_elevated(); return 0;
+            case IDM_ABOUT: show_about(); return 0;
+            case IDM_HOMEPAGE:
+                ShellExecuteW(g_window, L"open", L"https://github.com/U707T/FileLocksmith-Standalone", nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
+
             default: break;
             }
             break;
@@ -555,6 +676,22 @@ namespace
             return TRUE;
         }
 
+        case WM_INITMENUPOPUP:
+            // 菜单里的勾选状态每次弹出时重新读一遍注册表（可能在外部被改动）
+            if (l_param == 0)
+            {
+                update_menu_state();
+            }
+            return 0;
+
+        case WM_KEYDOWN:
+            if (w_param == VK_F5)
+            {
+                start_search();
+                return 0;
+            }
+            break;
+
         case WM_NOTIFY:
         {
             auto header = reinterpret_cast<NMHDR*>(l_param);
@@ -583,18 +720,25 @@ namespace
                 g_handles_query_ok = payload->locks.handles_query_ok;
                 fill_list();
 
+                const auto unresolved = payload->locks.unresolved_paths.size();
                 if (!g_handles_query_ok)
                 {
                     set_status(L"句柄枚举失败：结果不可信，请点“以管理员身份重启”后重试。");
                 }
                 else if (g_results.empty())
                 {
-                    set_status(L"没有进程正在占用这些文件。");
+                    set_status(unresolved == 0
+                                   ? L"没有进程正在占用这些文件。"
+                                   : L"没有进程占用 —— 但有 " + std::to_wstring(unresolved) + L" 个路径打不开（不存在或没权限），实际没有被检查。");
                 }
                 else
                 {
                     std::wstring text = L"找到 " + std::to_wstring(g_results.size()) + L" 个进程正在占用" +
                                         L"（可强制关闭的文件句柄 " + std::to_wstring(g_handles.size()) + L" 个）";
+                    if (unresolved > 0)
+                    {
+                        text += L"；另有 " + std::to_wstring(unresolved) + L" 个路径打不开，已跳过";
+                    }
                     if (!app::is_process_elevated())
                     {
                         text += L"，系统进程可能因权限不足而看不到";
@@ -682,13 +826,32 @@ namespace gui
         else
         {
             SetFocus(g_list);
+            set_status(shell_integration::is_context_menu_installed()
+                           ? L"把文件拖进来，或在资源管理器里右键 → 什么正在占用这个文件？"
+                           : L"提示: 还没添加右键菜单 —— 点上面的「文件」菜单 → 添加到资源管理器右键菜单。");
         }
+
+        // F5 必须走加速键表：键盘消息是发给焦点控件的（这里是 ListView），
+        // 光在主窗口的 WM_KEYDOWN 里判断收不到。
+        ACCEL accelerators[] = {
+            { FVIRTKEY, VK_F5, IDM_REFRESH },
+        };
+        HACCEL accelerator_table = CreateAcceleratorTableW(accelerators, ARRAYSIZE(accelerators));
 
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0))
         {
+            if (accelerator_table != nullptr && TranslateAcceleratorW(window, accelerator_table, &message) != 0)
+            {
+                continue;
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+
+        if (accelerator_table != nullptr)
+        {
+            DestroyAcceleratorTable(accelerator_table);
         }
 
         // Give the (detached) enumeration thread a moment to notice that the
