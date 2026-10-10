@@ -1,0 +1,15 @@
+# 构建产物（正式版由 CI 构建并发布到 Release，仓库里不放二进制）
+build/
+out/
+dist/
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.user
+.vs/
+.cache/

@@ -1,0 +1,174 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - LICENSE-PowerToys-MIT.txt
+  pull_request:
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - LICENSE-PowerToys-MIT.txt
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------- Windows x64（MSVC，正式产物 + 功能自测）
+  build-msvc:
+    runs-on: windows-2022
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+      - name: Show version
+        shell: pwsh
+        run: Write-Host "VERSION = $((Get-Content VERSION -Raw).Trim())"
+      - name: Configure (Visual Studio 2022, x64)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build release
+        run: cmake --build build --config Release
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item build\Release\FileLocksmith.exe out\FileLocksmith-x64.exe
+          (Get-Item out\FileLocksmith-x64.exe).VersionInfo | Format-List FileVersion, ProductVersion, FileDescription
+      - name: Smoke test (--version 与 VERSION 文件一致)
+        shell: pwsh
+        run: |
+          $expected = (Get-Content VERSION -Raw).Trim()
+          $exe = (Resolve-Path 'out\FileLocksmith-x64.exe').Path
+          $actual = (& $exe --version | Out-String).Trim()
+          Write-Host "VERSION 文件: $expected"
+          Write-Host "--version 输出: $actual"
+          if ($actual -notmatch [regex]::Escape($expected)) { throw "版本号不一致" }
+      # 真机端到端自测：找占用者 + 结束占用者
+      - name: Functional test (真实占用检测 + 结束占用进程)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'out\FileLocksmith-x64.exe').Path
+          $dir = Join-Path $env:RUNNER_TEMP 'fl-test'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $file = Join-Path $dir 'locked.txt'
+          Set-Content -Path $file -Value 'hello'
+
+          # --- 用例 1：当前 PowerShell 进程独占持有文件句柄 ---
+          $stream = [System.IO.File]::Open($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+          Write-Host "用例 1：本进程 PID = $PID 独占占用 $file"
+          $raw = & $exe $file --json
+          $code = $LASTEXITCODE
+          $json = ($raw | Out-String)
+          Write-Host "FileLocksmith 输出: $json"
+          $stream.Close()
+          $stream.Dispose()
+          if ($code -ne 0) { throw "退出码 $code" }
+          if ($json -notmatch '"pid"\s*:\s*' + $PID + '\b') { throw "未检测到占用者 PID $PID" }
+          Write-Host "用例 1 通过：检测到占用进程 $PID"
+
+          # --- 用例 2：另外一个进程持有句柄，用 --kill 结束它 ---
+          $blocker = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile','-NonInteractive','-Command',
+            "`$f=[System.IO.File]::Open('$file','Open','ReadWrite','None'); Start-Sleep -Seconds 300"
+          )
+          Write-Host "用例 2：阻塞进程 PID = $($blocker.Id)"
+          $found = $false
+          for ($i = 0; $i -lt 6; $i++) {
+            Start-Sleep -Seconds 5
+            $json2 = (& $exe $file --json | Out-String)
+            if ($json2 -match '"pid"\s*:\s*' + $blocker.Id + '\b') { $found = $true; break }
+          }
+          if (-not $found) {
+            Stop-Process -Id $blocker.Id -Force -ErrorAction SilentlyContinue
+            throw "未检测到阻塞进程 $($blocker.Id)，输出：$json2"
+          }
+          Write-Host "用例 2 通过：检测到阻塞进程"
+
+          & $exe $file --kill | Out-Null
+          Start-Sleep -Seconds 3
+          if (-not $blocker.HasExited) {
+            Stop-Process -Id $blocker.Id -Force -ErrorAction SilentlyContinue
+            throw "--kill 没有结束掉阻塞进程"
+          }
+          Write-Host "用例 2 通过：--kill 已结束阻塞进程"
+
+          $remaining = (& $exe $file --json | Out-String)
+          Write-Host "清理后查询：$remaining"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileLocksmith-x64.exe
+          path: out/FileLocksmith-x64.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Linux 交叉编译（MinGW，可复现构建）
+  build-mingw:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64 cmake
+      - name: Configure (cross compile to Windows x64)
+        run: cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw.cmake -DCMAKE_BUILD_TYPE=Release
+      - name: Build release
+        run: cmake --build build -j"$(nproc)"
+      - name: Collect artifact
+        run: |
+          mkdir -p out
+          cp build/FileLocksmith.exe out/FileLocksmith-x64-mingw.exe
+          file out/FileLocksmith-x64-mingw.exe || true
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileLocksmith-x64-mingw.exe
+          path: out/FileLocksmith-x64-mingw.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 发布
+  # 仅当 VERSION 文件里的版本号尚无对应 tag 时创建 Release（普通提交只构建不发布）
+  release:
+    if: |
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - build-msvc
+      - build-mingw
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      - name: Check tag
+        uses: mukunku/tag-exists-action@v1.6.0
+        id: check-tag
+        with:
+          tag: v${{ steps.version.outputs.VERSION }}
+      - name: Download artifacts
+        if: steps.check-tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Release
+        if: steps.check-tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+          files: |
+            artifacts/FileLocksmith-x64.exe
+            artifacts/FileLocksmith-x64-mingw.exe

@@ -1,0 +1,402 @@
+// FileLocksmith standalone - command line interface
+// Portions derived from Microsoft PowerToys (MIT License, (c) Microsoft Corporation).
+#include "cli.h"
+#include "app_utils.h"
+#include "file_locksmith.h"
+
+#include <version.h>
+
+namespace
+{
+    constexpr wchar_t ProductName[] = L"FileLocksmith";
+
+    std::wstring product_version()
+    {
+        return app::to_wstring(FL_VERSION_STRING) + L" (standalone extraction of PowerToys FileLocksmith)";
+    }
+
+    std::wstring usage()
+    {
+        std::wstring text;
+        text += L"FileLocksmith - 查看/结束正在占用文件的进程\n";
+        text += L"版本 " + app::to_wstring(FL_VERSION_STRING) + L"，由 PowerToys FileLocksmith 模块独立提取而来\n\n";
+        text += L"用法: FileLocksmith.exe [选项] <文件或目录> [更多路径...]\n\n";
+        text += L"选项:\n";
+        text += L"  --json             以 JSON 输出结果\n";
+        text += L"  --kill             结束所有占用这些文件的进程\n";
+        text += L"  --wait             等待直到文件被解锁\n";
+        text += L"  --timeout <毫秒>   --wait 的超时时间\n";
+        text += L"  --gui              强制打开图形界面\n";
+        text += L"  --cli              强制使用命令行模式\n";
+        text += L"  --elevate          以管理员身份重新启动\n";
+        text += L"  --register         添加右键菜单项（仅当前用户）\n";
+        text += L"  --unregister       移除右键菜单项\n";
+        text += L"  --version          显示版本\n";
+        text += L"  -h, --help         显示本帮助\n";
+        return text;
+    }
+
+    std::wstring json_escape(const std::wstring& text)
+    {
+        std::wstring result;
+        result.reserve(text.size() + 8);
+        for (wchar_t ch : text)
+        {
+            switch (ch)
+            {
+            case L'"': result += L"\\\""; break;
+            case L'\\': result += L"\\\\"; break;
+            case L'\b': result += L"\\b"; break;
+            case L'\f': result += L"\\f"; break;
+            case L'\n': result += L"\\n"; break;
+            case L'\r': result += L"\\r"; break;
+            case L'\t': result += L"\\t"; break;
+            default:
+                if (ch < 0x20)
+                {
+                    const wchar_t* hex = L"0123456789abcdef";
+                    result += L"\\u";
+                    result.push_back(hex[(static_cast<unsigned>(ch) >> 12) & 0xF]);
+                    result.push_back(hex[(static_cast<unsigned>(ch) >> 8) & 0xF]);
+                    result.push_back(hex[(static_cast<unsigned>(ch) >> 4) & 0xF]);
+                    result.push_back(hex[static_cast<unsigned>(ch) & 0xF]);
+                }
+                else
+                {
+                    result.push_back(ch);
+                }
+            }
+        }
+        return result;
+    }
+
+    std::wstring to_json(const std::vector<ProcessResult>& results)
+    {
+        std::wstring out = L"{\"processes\":[";
+        bool first_process = true;
+        for (const auto& result : results)
+        {
+            if (!first_process)
+            {
+                out += L',';
+            }
+            first_process = false;
+
+            out += L"{\"pid\":" + std::to_wstring(result.pid);
+            out += L",\"name\":\"" + json_escape(result.name) + L"\"";
+            out += L",\"user\":\"" + json_escape(result.user) + L"\"";
+            out += L",\"files\":[";
+            bool first_file = true;
+            for (const auto& file : result.files)
+            {
+                if (!first_file)
+                {
+                    out += L',';
+                }
+                first_file = false;
+                out += L"\"" + json_escape(file) + L"\"";
+            }
+            out += L"]}";
+        }
+        out += L"]}";
+        return out;
+    }
+
+    std::wstring to_text(const std::vector<ProcessResult>& results)
+    {
+        if (results.empty())
+        {
+            return L"没有找到占用该文件的进程。\n";
+        }
+
+        std::wstring out = L"PID\t用户\t进程\n";
+        for (const auto& result : results)
+        {
+            out += std::to_wstring(result.pid) + L"\t" + result.user + L"\t" + result.name + L"\n";
+        }
+        return out;
+    }
+
+    std::wstring kill_processes(const std::vector<ProcessResult>& results)
+    {
+        std::wstring out;
+        for (const auto& result : results)
+        {
+            if (app::terminate_process(result.pid))
+            {
+                out += L"已结束进程 " + std::to_wstring(result.pid) + L" (" + result.name + L")\n";
+            }
+            else
+            {
+                out += L"无法结束进程 " + std::to_wstring(result.pid) + L" (" + result.name + L")"
+                       + (app::is_process_elevated() ? L"，权限不足。\n" : L"，请以管理员身份重试。\n");
+            }
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    //  Shell integration
+    // ------------------------------------------------------------------
+    constexpr wchar_t ContextMenuKey[] = L"Software\\Classes\\*\\shell\\FileLocksmith";
+    constexpr wchar_t ContextMenuKeyDir[] = L"Software\\Classes\\Directory\\shell\\FileLocksmith";
+    constexpr wchar_t ContextMenuVerb[] = L"什么正在占用这个文件？";
+
+    bool set_reg_string(HKEY root, const std::wstring& sub_key, const wchar_t* name, const std::wstring& value)
+    {
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(root, sub_key.c_str(), 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        {
+            return false;
+        }
+        auto status = RegSetValueExW(key, name, 0, REG_SZ,
+                                     reinterpret_cast<const BYTE*>(value.c_str()),
+                                     static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+        return status == ERROR_SUCCESS;
+    }
+
+    bool delete_reg_tree(HKEY root, const std::wstring& sub_key)
+    {
+        return RegDeleteTreeW(root, sub_key.c_str()) == ERROR_SUCCESS;
+    }
+
+    int register_context_menu()
+    {
+        auto exe = app::executable_path();
+        auto command = app::quote_arg(exe) + L" \"%1\"";
+        auto icon = exe + L",0";
+
+        bool ok = true;
+        for (const auto* key : { ContextMenuKey, ContextMenuKeyDir })
+        {
+            std::wstring base(key);
+            ok = set_reg_string(HKEY_CURRENT_USER, base, nullptr, ContextMenuVerb) && ok;
+            ok = set_reg_string(HKEY_CURRENT_USER, base, L"Icon", icon) && ok;
+            ok = set_reg_string(HKEY_CURRENT_USER, base, L"MultiSelectModel", L"Player") && ok;
+            ok = set_reg_string(HKEY_CURRENT_USER, base + L"\\command", nullptr, command) && ok;
+        }
+
+        app::out(ok ? L"已添加右键菜单项（对文件和文件夹生效）。\n"
+                    L"提示: Windows 11 需在“显示更多选项”(Shift+F10) 中查看。\n"
+                  : L"写入注册表失败。\n");
+        return ok ? 0 : 1;
+    }
+
+    int unregister_context_menu()
+    {
+        delete_reg_tree(HKEY_CURRENT_USER, ContextMenuKey);
+        delete_reg_tree(HKEY_CURRENT_USER, ContextMenuKeyDir);
+        app::out(L"已移除右键菜单项。\n");
+        return 0;
+    }
+
+    bool is_cli_flag(const std::wstring& arg)
+    {
+        return arg == L"--json" || arg == L"--kill" || arg == L"--wait" || arg == L"--timeout" ||
+               arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
+               arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
+    }
+}
+
+namespace cli
+{
+    bool has_cli_arguments(const std::vector<std::wstring>& args)
+    {
+        for (const auto& arg : args)
+        {
+            if (is_cli_flag(arg))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+int cli_main(const std::vector<std::wstring>& args)
+{
+    bool json_output = false;
+    bool kill = false;
+    bool wait = false;
+    bool elevate = false;
+    int timeout_ms = -1;
+    std::vector<std::wstring> paths;
+
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const auto& arg = args[i];
+        if (arg == L"--json")
+        {
+            json_output = true;
+        }
+        else if (arg == L"--kill")
+        {
+            kill = true;
+        }
+        else if (arg == L"--wait")
+        {
+            wait = true;
+        }
+        else if (arg == L"--elevate")
+        {
+            elevate = true;
+        }
+        else if (arg == L"--timeout")
+        {
+            if (i + 1 >= args.size())
+            {
+                app::out(L"错误: --timeout 需要一个参数。\n");
+                return 1;
+            }
+            try
+            {
+                timeout_ms = std::stoi(args[++i]);
+            }
+            catch (...)
+            {
+                app::out(L"错误: --timeout 的值无效。\n");
+                return 1;
+            }
+        }
+        else if (arg == L"--help" || arg == L"-h")
+        {
+            app::out(usage());
+            return 0;
+        }
+        else if (arg == L"--version")
+        {
+            app::out(std::wstring(ProductName) + L" " + product_version() + L"\n");
+            return 0;
+        }
+        else if (arg == L"--register")
+        {
+            return register_context_menu();
+        }
+        else if (arg == L"--unregister")
+        {
+            return unregister_context_menu();
+        }
+        else if (arg == L"--cli" || arg == L"--gui")
+        {
+            // Handled by main().
+        }
+        else
+        {
+            paths.push_back(arg);
+        }
+    }
+
+    if (elevate)
+    {
+        if (app::is_process_elevated())
+        {
+            app::out(L"当前已经是管理员权限。\n");
+            return 0;
+        }
+        std::vector<std::wstring> new_args;
+        for (const auto& path : paths)
+        {
+            new_args.push_back(path);
+        }
+        if (new_args.empty())
+        {
+            new_args.push_back(L"--gui");
+        }
+        return app::relaunch_elevated(new_args) ? 0 : 1;
+    }
+
+    if (paths.empty())
+    {
+        app::out(L"错误: 没有指定任何路径。\n\n" + usage());
+        return 1;
+    }
+
+    app::enable_debug_privilege();
+
+    if (wait)
+    {
+        std::wstring out;
+        if (json_output)
+        {
+            out += L"警告: --wait 与 --json 不能同时使用，已忽略 --json。\n";
+            json_output = false;
+        }
+
+        out += L"正在等待文件被解锁...\n";
+        app::out(out);
+
+        auto start_time = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            std::vector<ProcessResult> results;
+            try
+            {
+                results = find_processes_recursive(paths);
+            }
+            catch (const std::exception& ex)
+            {
+                app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
+                return 1;
+            }
+            if (results.empty())
+            {
+                app::out(L"文件已解锁。\n");
+                return 0;
+            }
+
+            if (timeout_ms >= 0)
+            {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+                if (elapsed > timeout_ms)
+                {
+                    app::out(L"等待超时: 文件仍被占用。\n");
+                    return 1;
+                }
+            }
+
+            Sleep(200);
+        }
+    }
+
+    std::vector<ProcessResult> results;
+    try
+    {
+        results = find_processes_recursive(paths);
+    }
+    catch (const std::exception& ex)
+    {
+        app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
+        return 1;
+    }
+
+    std::wstring output;
+    if (kill)
+    {
+        output += kill_processes(results);
+        try
+        {
+            results = find_processes_recursive(paths);
+        }
+        catch (const std::exception&)
+        {
+            results.clear();
+        }
+    }
+
+    if (json_output)
+    {
+        output += to_json(results) + L"\n";
+    }
+    else
+    {
+        output += to_text(results);
+        if (!results.empty() && !app::is_process_elevated())
+        {
+            output += L"\n提示: 部分系统级进程需要管理员权限才能看到或结束，可使用 --elevate。\n";
+        }
+    }
+
+    app::out(output);
+    return 0;
+}
