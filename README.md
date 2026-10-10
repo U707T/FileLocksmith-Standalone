@@ -18,7 +18,7 @@
 
 | 子工程 | 作用 | 抽离处理 |
 | --- | --- | --- |
-| `FileLocksmithLibInterop`（`FileLocksmith.cpp` / `NtdllBase` / `NtdllExtensions` / `NativeMethods`） | **核心算法**：枚举全系统句柄 → 匹配文件内核路径 → 反查进程/用户 | ✅ 原样保留（只把 `pch.h` 里的 C++/WinRT 依赖剥掉，`FILELOCKSMITH_LIB_STATIC` 那条分支本来就不需要它） |
+| `FileLocksmithLibInterop`（`FileLocksmith.cpp` / `NtdllBase` / `NtdllExtensions` / `NativeMethods`） | **核心算法**：枚举全系统句柄 → 匹配文件内核路径 → 反查进程/用户 | ✅ 保留（剥掉 `pch.h` 里的 C++/WinRT 依赖，`FILELOCKSMITH_LIB_STATIC` 那条分支本来就不需要它；2.0.3 又在并发细节上做了加固，见第 2 节） |
 | `FileLocksmithCLI` | 命令行前端 | ✅ 保留设计，重写：去掉 spdlog、PowerToys 遥测、C++/WinRT json，改自带参数解析 + 手写 JSON |
 | `FileLocksmithUI`（WinUI 3 + Windows App SDK） | 图形界面 | ✅ 保留功能，界面换成 **Win32 原生控件**（ListView + 按钮 + 拖放），彻底摆脱 Windows App SDK |
 | `FileLocksmithExt`（`IExplorerCommand` 外壳扩展 DLL） | 右键菜单 | ❌ 去掉，改用 **HKCU 注册表 verb**（无需 MSIX、无需管理员、无需注册 DLL） |
@@ -31,7 +31,7 @@
 
 ---
 
-## 2. 核心原理（保留原实现，未做更改）
+## 2. 核心原理（保留原设计，未改语义）
 
 1. `NtQuerySystemInformation(SystemExtendedHandleInformation)` 拿到全系统句柄表；
 2. 逐个 `DuplicateHandle` 到本进程，用 `NtQueryObject(ObjectTypeInformation)` 判断类型是不是 `File`；
@@ -40,10 +40,14 @@
 5. 反过来枚举进程（`SystemProcessInformation`）+ 各进程加载的模块（`EnumProcessModules`），模块被占用也算；
 6. `OpenProcessToken` + `LookupAccountSid` 拿到占用者用户名。
 
-**关键保护（原样保留）**：第 3 步的 `NtQueryObject` 在个别句柄上会永久卡死，且没有超时参数。
+**关键保护（机制保留，2.0.3 起加固）**：第 3 步的 `NtQueryObject` 在个别句柄上会永久卡死，且没有超时参数。
 原实现把这一轮循环丢到独立线程里跑，主线程每 200 ms 检查进度；如果 200 ms 内进度没增长，
 就 `TerminateThread` 干掉它并跳过该句柄继续。这是这个工具能在真有问题的机器上跑完的原因，
 **不要为了"优雅"把它删掉**。
+
+配套加固（2.0.3）：既然这条路径上会杀线程，工作线程就**不允许写任何共享容器** —— 进程句柄表改成
+"起线程前一次性打开（有序 POD 数组 + 只读二分查找）"，结果向量预留容量避开扩容重分配窗口；
+`NtQueryObject` 名字缓冲区不足（超长路径）时换局部缓冲区重试，不再静默漏句柄。
 
 ---
 
@@ -65,11 +69,11 @@ FileLocksmith-Standalone/
 │   ├── version.h.in            # 由 CMake 按 VERSION 生成 version.h（C++ 与 .rc 共用）
 │   └── resource.rc             # 图标 + 清单 + 版本信息
 ├── src/
-│   ├── win_common.h            # 公共头 + MinGW 需要的 NT 兼容定义
-│   ├── ntdll_base.{h,cpp}      # ntdll 函数指针封装（原样）
-│   ├── ntdll_extensions.{h,cpp}# 句柄/进程/用户枚举（原样，含反挂起）
-│   ├── file_locksmith.{h,cpp}  # find_processes_recursive（原样）
-│   ├── process_result.h        # 结果结构（原样）
+│   ├── win_common.h            # 公共头 + MinGW 需要的 NT 兼容定义 + load_proc（GetProcAddress 中转）
+│   ├── ntdll_base.{h,cpp}      # ntdll 函数指针封装
+│   ├── ntdll_extensions.{h,cpp}# 句柄/进程/用户枚举（源自 PowerToys；含反挂起 + 2.0.3 并发加固）
+│   ├── file_locksmith.{h,cpp}  # 匹配/解锁/删除等动作（源自 PowerToys 的 find_locks）
+│   ├── process_result.h        # 结果结构（源自 PowerToys）
 │   ├── app_utils.{h,cpp}       # 控制台/提权/结束进程等 Win32 工具
 │   ├── cli.{h,cpp}             # 命令行模式
 │   ├── gui.h                   # 图形界面对外入口（gui::run）
@@ -78,6 +82,7 @@ FileLocksmith-Standalone/
 │   ├── gui_search.cpp          # 扫描线程、路径收集、结果填充
 │   ├── gui_actions.cpp         # 结束/解锁/删除/定位/复制/文件对话框
 │   ├── gui_main.cpp            # 窗口过程与程序入口
+│   ├── ui_state.{h,cpp}        # 窗口位置/大小、列宽持久化（HKCU\Software\FileLocksmith\Ui）
 │   ├── shell_integration.{h,cpp} # 资源管理器集成：右键菜单注册 / 「发送到」快捷方式（CLI 与 GUI 共用）
 │   └── main.cpp                # 入口：自动决定命令行还是图形界面
 └── dist/FileLocksmith.exe      # 本地构建产物（被 .gitignore 忽略，仓库不放二进制）
@@ -218,11 +223,12 @@ DuplicateHandle(hProcess, (HANDLE)remoteHandle, GetCurrentProcess(),
 | Windows 11 | 支持 |
 | 架构 | x64（ARM64 设备走 x64 模拟；也可自行用 llvm-mingw 编 ARM64） |
 | 运行依赖 | 无。静态链接 CRT，不需要 .NET / Windows App SDK / VC++ 运行时 |
-| 实测环境 | Windows Server 2022（10.0.20348，与 Win10 同一 NT 10.0 代）；`--version` 会打印它所在系统的版本号 |
+| 实测环境 | Windows Server 2022（10.0.20348，CI 每个版本都跑）+ **Windows 10 22H2（10.0.19045）真机**（2026-10-10，v2.0.4，一键自测 11/11 全过）；`--version` 会打印它所在系统的版本号 |
 
 > CI 已经**不再提供 Windows 10 的 runner**（`windows-2019` 已下线，只剩 Server 2022/2025 和 Win11-ARM），
-> 所以"适配 Win10"的依据是：目标版本/子系统版本声明 + 只用 Win7 起的 API + manifest 兼容性声明，
-> 并且 CI 会守住这几条（`Smoke test` 里断言 PE 机器类型、子系统版本、supportedOS GUID）。
+> 所以"适配 Win10"的依据是：目标版本/子系统版本声明 + 只用 Win7 起的 API + manifest 兼容性声明 +
+> **真机验证**（2026-10-10 在 Windows 10 22H2 上跑通 `tools\run-local-tests.ps1` 全部 11 个用例），
+> 并且 CI 会守住 PE/manifest 那几条（`Smoke test` 里断言 PE 机器类型、子系统版本、supportedOS GUID）。
 > 真机若在 Win10 上出问题，`--version` 的输出（含系统版本）可以直接贴进 issue。
 
 ## 7. 自己编译
@@ -291,24 +297,28 @@ Win11 的「发送到」在**一级菜单**里，比传统 verb 少点一步。
 1. **提权才能看全**：非管理员下，部分系统级进程的句柄 `OpenProcess`/`DuplicateHandle` 会失败，
    结果会偏少。程序启动时会尝试开启 `SeDebugPrivilege`，但不是万能药；界面上有"以管理员身份重启"。
 2. **`TerminateThread` 是有意为之**：见第 2 节。它是"不安全的"API，但在 `NtQueryObject` 卡死时
-   没有别的办法，原版 PowerToys 就是这么做的。
+   没有别的办法，原版 PowerToys 就是这么做的。2.0.3 已把"工作线程会碰到的共享状态"压到最小
+   （进程句柄预开只读 + 结果向量预留容量），但仍有一个 Windows 固有性质躲不掉：
+   线程被杀的那一刻若正持着堆锁，后续内存分配可能阻塞 —— 这是该机制的已知代价。
 3. **枚举有开销**：每次查询要遍历全系统句柄表，**并且为了查出"被当成 DLL/EXE 加载"的情况，
-   还会对每个进程枚举模块**（`EnumProcessModules` + 逐个取模块路径）。进程多、模块多的机器上可能几秒，
-   这是当前最值得优化的地方（GUI 里放在后台线程，不会卡界面）。
+   还会对每个进程枚举模块**（`EnumProcessModules` + 逐个取模块路径）。进程多、模块多的机器上可能几秒
+   （GUI 里放在后台线程，不会卡界面；2.0.3 起 `--wait` 的轮询会跳过模块枚举，只有判定"解锁"时才完整查一次）。
 4. **结束进程 = `TerminateProcess`**：没有"保存数据"的优雅退出，界面上有二次确认。
    「强制解锁」同样有副作用（关别人的句柄），见第 5 节。
 5. **图形界面没有自动化测试**：CI 只覆盖命令行与核心逻辑（真机端到端），
    按钮点击、拖放、列表交互这些只能靠手点 —— 「打开所在位置」按钮的 ID 串位 bug 就是这么漏出去的，
    1.1.0 已修（见 CHANGELOG）。
-6. **不做持久化**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
+6. **不写配置文件**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
+   唯一持久化的数据是窗口位置/大小与列宽，存在 `HKCU\Software\FileLocksmith\Ui`（`ui_state`），
+   删掉它不影响任何功能。
 7. **搜索状态机还没有单元测试**：`start_search` / 过期结果丢弃 / 排队重扫这套逻辑目前埋在 GUI 里，
    只能靠时序推演和手点验证 —— 2.0.1 的拖放死锁正是这里漏了一次状态复位造成的
    （编译器与 CI 都抓不到）。计划把它抽成纯函数（输入：新请求/结果到达，输出：是否渲染/是否重扫）
    并加进 CI 用例。
-8. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
-   放在冒烟测试里 —— CI 的 `windows-2022` job 会真的创建一个被独占占用的文件，断言 exe 能报出
-   占用者的 PID 与用户名；再用 `--kill` 断言占用进程被结束；用 `--unlock` 断言文件被解锁
-   而持有它的进程仍然活着。GUI 窗口的交互（点击、拖放）CI 覆盖不到，有问题请提 issue。
+8. **运行时验证**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
+   由两处承担 —— CI 的 `windows-2022` job（11 个端到端用例）与真机一键自测
+   （2026-10-10 在 Windows 10 22H2 上 11/11 全过）。GUI 窗口的交互（点击、拖放）两者都覆盖不到，
+   有问题请提 issue。
 
 ---
 
@@ -322,21 +332,30 @@ Win11 的「发送到」在**一级菜单**里，比传统 verb 少点一步。
 | `build-mingw` | `ubuntu-latest` | MinGW-w64 交叉编译 → 上传 `FileLocksmith-x64-mingw.exe` |
 | `release` | `ubuntu-latest` | 若 `VERSION` 对应的 tag 还不存在 → 创建 Release 并附上两个 exe |
 
-**Windows runner 上的功能自测是真的端到端验证**（本地 Linux 沙箱跑不了 Windows 程序）：
+**Windows runner 上的功能自测是真的端到端验证**（本地 Linux 沙箱跑不了 Windows 程序），一共 **11 个用例**：
 
-1. 让当前 PowerShell 进程用 `FileShare::None` 独占打开一个临时文件，
-   然后 `FileLocksmith.exe <file> --json`，断言输出里出现该进程的 PID；
-2. 另起一个进程持有文件句柄，断言能被检测到，再 `--kill` 断言它确实被结束；
-3. 断言 `--version` 的输出与 `VERSION` 文件一致。
+1. 检出占用者（本进程用 `FileShare::None` 独占打开临时文件 → 断言输出里有该 PID）；
+2. 打不开的路径进 `unresolved`，不能被当成"没有占用"；
+3. `--kill` 结束占用进程；
+4. `--unlock` 关句柄但不结束进程（断言文件能打开了、进程还活着）；
+5. `--json` 的 stdout 只剩一行合法 JSON（`已强制关闭 …` 这类说明全在 stderr）；
+6. 右键菜单注册 / 移除（含 `%V` 与 `%1` 的区分）；
+7. 「发送到」快捷方式创建（走 IShellLink COM）；
+8. 没有占用时不误报；
+9. 快捷方式 → 展开整棵进程树 → 全部结束（含子进程）；
+10. `--delete`：被占用的文件先关句柄再删除，**占用进程不被杀**；
+11. `--delete --no-unlock`：不碰别人的句柄，失败即失败。
+
+另有 `--version` 与 manifest / PE 兼容性断言。本机跑的是同一套：`tools\run-local-tests.ps1`。
 
 发版流程（与本工作区其他项目一致）：
 
 ```bash
 # 1. 改版本号（唯一来源）
-echo "1.1.0" > VERSION
+echo "2.0.5" > VERSION          # 带 -rc 后缀（如 2.0.5-rc1）会自动发成 prerelease
 # 2. CHANGELOG.md 顶部加一段
-# 3. 推送 → CI 全绿 → 自动创建 Release（版本号带 -rc 后缀会自动标记为 prerelease）
-git add -A && git commit -m "chore: 发布 1.1.0" && git push origin main
+# 3. 推送 → CI 全绿 → 自动创建 Release
+git add -A && git commit -m "chore: 发布 2.0.5" && git push origin main
 ```
 
 tag 已存在时 `release` job 只编译不重发，避免重复发布。
@@ -348,16 +367,19 @@ tag 已存在时 `release` job 只编译不重发，避免重复发布。
 ```powershell
 # 解压后，在含 exe 的目录里：
 pwsh -File tools\run-local-tests.ps1 -Exe .\FileLocksmith-x64.exe
+# 若报 "SecurityError: …未进行数字签名"（执行策略为 AllSigned），给这次运行放行：
+pwsh -ExecutionPolicy Bypass -File tools\run-local-tests.ps1 -Exe .\FileLocksmith-x64.exe
 # Windows PowerShell 5.1 也行：
 powershell -ExecutionPolicy Bypass -File tools\run-local-tests.ps1
 ```
 
-脚本会自己造"被独占占用的文件"、起测试进程、跑 8 个用例，最后打印通过/失败数；
+脚本会自己造"被独占占用的文件"、起测试进程、跑 **11 个用例**（与 CI 同一套），最后打印通过/失败数；
 全部通过退出码 0，有失败退出码 1。它只动自己起的测试进程和 `%TEMP%\fl-local-test`，
 右键菜单与「发送到」快捷方式是**临时注册后立刻清理**。
 
-> ⚠️ 别用管理员权限跑这个脚本：一是没必要，二是提权后 CI 里那些基于 UIPI 的边界行为会变样。
-> 想专门测提权路径，手工跑 `FileLocksmith-x64.exe --elevate <文件>`。
+> ⚠️ 别用管理员权限跑这个脚本：一是没必要，二是提权后能检测到/能结束的进程范围会变大，
+> 用例里"权限不足"那类预期可能变样。想专门测提权路径，手工跑 `FileLocksmith-x64.exe --elevate <文件>`，
+> 以及第 12 节图形界面清单里的"管理员模式拖放"一条。
 
 ### 手工验证清单
 
@@ -378,6 +400,9 @@ powershell -ExecutionPolicy Bypass -File tools\run-local-tests.ps1
 
 - 双击 exe → 把文件**拖到列表区域**（重点：1.2.1 之前这里没反应）、拖到按钮上、拖到状态栏上都要能接；
 - 拖到 **exe 图标 / 快捷方式**上：已有窗口的话应该合并到同一个窗口，没开的话新开一个；
+- **管理员模式（2.0.4 起应可用）**：右键 exe →「以管理员身份运行」，再拖文件进窗口应能接住；
+  保持该窗口打开，把第二个文件拖到 exe 图标上应合并进已有窗口（而不是新开）；
+  若无效请回报系统版本 —— 退路是「文件 → 添加文件…」；
 - 「文件 → 添加文件…（Ctrl+O）/ 添加文件夹…」能选多选文件；
 - 「文件 → 添加到资源管理器右键菜单」勾上后，去资源管理器右键验证（Win10 在一级菜单，Win11 在"显示更多选项"）；
 - 选中进程 → `结束进程` / `强制解锁`（后者会弹风险确认）；
