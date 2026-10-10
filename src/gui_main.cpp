@@ -88,10 +88,7 @@ namespace gui::detail
                 init_icons();
             }
 
-            // 空态提示：贴在列表区域中央（在列表之后创建 → 位于列表上层；拖放照常能接）
-            ui().empty_hint = CreateWindowExW(0, L"STATIC", L"把文件或文件夹拖到这里\n或按 Ctrl+O 选择文件",
-                                             WS_CHILD | SS_CENTER | SS_NOPREFIX,
-                                             0, 0, 0, 0, hwnd, control_id(IDC_EMPTY_HINT), ui().instance, nullptr);
+            // 空态提示画在列表的 WM_PAINT 里（见 drop_subclass_proc），这里不用建额外控件
 
             for (int i = 0; i < BUTTON_COUNT; ++i)
             {
@@ -113,7 +110,7 @@ namespace gui::detail
             // 提权模式下这些窗口也要能收到资源管理器的拖放（见 allow_unelevated_drop 的说明）
             allow_unelevated_drop(hwnd);
             DragAcceptFiles(hwnd, TRUE);
-            for (HWND child : { ui().list, ui().headline, ui().subline, ui().header_icon, ui().empty_hint, ui().status })
+            for (HWND child : { ui().list, ui().headline, ui().subline, ui().header_icon, ui().status })
             {
                 SetWindowSubclass(child, drop_subclass_proc, DROP_SUBCLASS_ID, 0);
                 allow_unelevated_drop(child);
@@ -126,7 +123,6 @@ namespace gui::detail
                 DragAcceptFiles(ui().buttons[i], TRUE);
             }
             update_header();
-            update_empty_hint();
             layout(hwnd);
             return 0;
 
@@ -304,8 +300,7 @@ namespace gui::detail
             // 副标题（未检查时的引导语）与空态提示用灰色弱化，其余用正文色。
             auto dc = reinterpret_cast<HDC>(w_param);
             auto control = reinterpret_cast<HWND>(l_param);
-            const bool muted = control == ui().empty_hint ||
-                               (control == ui().subline && ui().paths.empty());
+            const bool muted = control == ui().subline && ui().paths.empty();
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, GetSysColor(muted ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
             return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));

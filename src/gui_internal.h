@@ -34,7 +34,6 @@ namespace gui::detail
     constexpr int IDC_DELETE_FILES = 1010;
     constexpr int IDC_HEADER_ICON = 1012;
     constexpr int IDC_HEADLINE = 1013;
-    constexpr int IDC_EMPTY_HINT = 1014;
     constexpr int IDM_TOGGLE_CONTEXT_MENU = 2001;
     constexpr int IDM_INSTALL_SENDTO = 2002;
     constexpr int IDM_OPEN_SENDTO = 2003;
@@ -105,7 +104,6 @@ namespace gui::detail
         HWND subline = nullptr;
         HWND header_icon = nullptr;
         HWND headline = nullptr;
-        HWND empty_hint = nullptr;
         HWND tooltip = nullptr;
         HWND hot_button = nullptr;               // 鼠标悬停的按钮（自绘用）
         HWND buttons [BUTTON_COUNT] = {};
@@ -159,10 +157,10 @@ namespace gui::detail
     int buttons_row_width();
     // 按控件 ID 找按钮：避免"数组下标 = 语义"的隐式耦合（改一次按钮表就可能错位）
     HWND button_by_id(int id);
+    // 这个 HWND 是不是我们的按钮（悬停跟踪用；别拿样式位去猜，会被 STATIC/ListView 误命中）
+    bool is_button_window(HWND wnd);
     void init_list_extras();
     void init_tooltips(HWND parent);
-    // 列表为空时的居中提示（贴在列表区域里，拖放同样能接）
-    void update_empty_hint();
     void build_menu(HWND hwnd);
     // 控件 ID 通过 CreateWindowExW 的 HMENU 参数传递；经 INT_PTR 中转以满足 64 位 MSVC（C4312）
     inline HMENU control_id(int id)

@@ -76,24 +76,6 @@ namespace gui::detail
         }
     }
 
-    void update_empty_hint()
-    {
-        if (ui().empty_hint == nullptr)
-        {
-            return;
-        }
-        // 只在"没有结果、也没在扫描"时显示（列表为空时它就是视觉重心）
-        const bool show = ui().results.empty() && !ui().searching;
-        if (show)
-        {
-            SetWindowTextW(ui().empty_hint,
-                           ui().paths.empty()
-                               ? L"把文件或文件夹拖到这里\n或按 Ctrl+O 选择文件"
-                               : L"没有进程占用这些文件\n（列表里只列出占用者）");
-        }
-        ShowWindow(ui().empty_hint, show ? SW_SHOW : SW_HIDE);
-    }
-
     void resize_columns(int list_width)
     {
         if (!IsWindow(ui().list) || ListView_GetHeader(ui().list) == nullptr)
@@ -190,6 +172,20 @@ namespace gui::detail
         return nullptr;
     }
 
+    bool is_button_window(HWND wnd)
+    {
+        // 注意：不能拿 "style & BS_OWNERDRAW" 判断 —— STATIC 的 SS_CENTER(0x1) 会和
+        // BS_OWNERDRAW(0xB) 低位重叠，列表的 LVS_REPORT(0x1) 也一样，会误命中。
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            if (ui().buttons[i] == wnd)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void layout(HWND hwnd)
     {
         RECT client{};
@@ -219,16 +215,6 @@ namespace gui::detail
         }
         MoveWindow(ui().list, margin, y, client.right - 2 * margin, remaining, TRUE);
 
-        // 空态提示：居中放在列表区域里（列表为空时它就是视觉重心）
-        if (ui().empty_hint != nullptr)
-        {
-            const int hint_width = scale(340);
-            const int hint_height = scale(56);
-            MoveWindow(ui().empty_hint,
-                       margin + (client.right - 2 * margin - hint_width) / 2,
-                       y + (remaining - hint_height) / 2,
-                       hint_width, hint_height, TRUE);
-        }
         y += remaining + gap + scale(4);
 
         // 按钮全行等距：间隔一致，窗口富余时整行居中（不硬撑、也不挤在左边）
@@ -301,7 +287,34 @@ namespace gui::detail
                 return 0;
             }
         }
-        else if (message == WM_MOUSEMOVE && (GetWindowLongPtrW(hwnd, GWL_STYLE) & BS_OWNERDRAW) != 0)
+        else if (message == WM_PAINT && hwnd == ui().list)
+        {
+            // 列表为空时在中间画一行引导文字。直接画在列表自己的 WM_PAINT 里 ——
+            // 不用额外的 STATIC 控件：那种"浮在上面的兄弟窗口"会被 z-order / 重绘
+            // 折腾得时有时无（2.3.0 就丢过一次），画在这里是确定性的。
+            const LRESULT result = DefSubclassProc(hwnd, message, w_param, l_param);
+            if (ui().results.empty() && !ui().searching)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                HDC dc = GetDC(hwnd);
+                if (dc != nullptr)
+                {
+                    const wchar_t* text = ui().paths.empty()
+                                              ? L"把文件或文件夹拖到这里\n或按 Ctrl+O 选择文件"
+                                              : L"没有进程占用这些文件\n（列表里只列出占用者）";
+                    HGDIOBJ previous = SelectObject(dc, ui().font != nullptr ? ui().font : GetStockObject(DEFAULT_GUI_FONT));
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                    RECT text_rect = client;
+                    DrawTextW(dc, text, -1, &text_rect, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+                    SelectObject(dc, previous);
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+            return result;
+        }
+        else if (message == WM_MOUSEMOVE && is_button_window(hwnd))
         {
             // 自绘按钮的悬停反馈（原生按钮自带，owner-draw 之后要自己跟踪）
             if (ui().hot_button != hwnd)
@@ -373,7 +386,7 @@ namespace gui::detail
         }
         SendMessageW(ui().headline, WM_SETFONT,
                      reinterpret_cast<WPARAM>(ui().headline_font != nullptr ? ui().headline_font : ui().font), TRUE);
-        for (HWND control : { ui().subline, ui().list, ui().status, ui().empty_hint })
+        for (HWND control : { ui().subline, ui().list, ui().status })
         {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui().font), TRUE);
         }
@@ -464,6 +477,7 @@ namespace gui::detail
 
         GdiPlusApi g_gdiplus;
         bool g_gdiplus_ready = false;
+        bool g_gdiplus_probing = false;
         bool g_gdiplus_probed = false;
         ULONG_PTR g_gdiplus_token = 0;
 
@@ -481,8 +495,9 @@ namespace gui::detail
             const float height = static_cast<float>(rect.bottom - rect.top) - 1.0f;
             const float diameter = static_cast<float>(radius) * 2.0f;
 
-            if (antialias && g_gdiplus_ready)
+            if (antialias && (g_gdiplus_ready || g_gdiplus_probing))
             {
+                bool drawn = false;
                 void* graphics = nullptr;
                 void* path = nullptr;
                 if (g_gdiplus.create_graphics(dc, &graphics) == 0 && graphics != nullptr &&
@@ -498,22 +513,29 @@ namespace gui::detail
                     void* brush = nullptr;
                     if (g_gdiplus.create_fill(gdiplus_color(fill), &brush) == 0 && brush != nullptr)
                     {
-                        g_gdiplus.fill_path(graphics, path, brush);
+                        // 注意参数顺序：GdipFillPath(graphics, brush, path)
+                        g_gdiplus.fill_path(graphics, brush, path);
                         g_gdiplus.delete_brush(brush);
                     }
                     void* pen = nullptr;
                     if (g_gdiplus.create_pen(gdiplus_color(border), 1.0f, kUnitPixel, &pen) == 0 && pen != nullptr)
                     {
-                        g_gdiplus.draw_path(graphics, path, pen);
+                        // 注意参数顺序：GdipDrawPath(graphics, pen, path)
+                        g_gdiplus.draw_path(graphics, pen, path);
                         g_gdiplus.delete_pen(pen);
                     }
                     g_gdiplus.delete_path(path);
+                    drawn = true;
                 }
                 if (graphics != nullptr)
                 {
                     g_gdiplus.delete_graphics(graphics);
                 }
-                return;
+                if (drawn)
+                {
+                    return;
+                }
+                // GDI+ 中途失败（比如参数不被支持）就继续往下走 GDI 兜底，绝不"什么都不画"
             }
 
             HBRUSH brush = CreateSolidBrush(fill);
@@ -526,6 +548,50 @@ namespace gui::detail
             DeleteObject(pen);
             DeleteObject(brush);
         }
+
+        // 自检：GdiplusStartup 成功 ≠ 画得出来。往 16×16 内存位图上画一个白底黑边的圆角矩形，
+        // 只要出现一个黑像素就说明描边真的落到画布上；否则一律走 GDI 兜底 ——
+        // 宁可要硬边圆角，也不能出现"白底白按钮"那种看不见的按钮。
+        bool gdiplus_can_draw()
+        {
+            HDC screen = GetDC(nullptr);
+            HDC memory = CreateCompatibleDC(screen);
+            HBITMAP bitmap = screen != nullptr ? CreateCompatibleBitmap(screen, 16, 16) : nullptr;
+            if (screen != nullptr)
+            {
+                ReleaseDC(nullptr, screen);
+            }
+            if (memory == nullptr || bitmap == nullptr)
+            {
+                if (bitmap != nullptr)
+                {
+                    DeleteObject(bitmap);
+                }
+                if (memory != nullptr)
+                {
+                    DeleteDC(memory);
+                }
+                return false;
+            }
+
+            HGDIOBJ previous = SelectObject(memory, bitmap);
+            const RECT rect{ 0, 0, 16, 16 };
+            fill_rounded_rect(memory, rect, 4, RGB(255, 255, 255), RGB(0, 0, 0), /* antialias */ true);
+            SelectObject(memory, previous);
+
+            bool ok = false;
+            for (int y = 0; y < 16 && !ok; ++y)
+            {
+                for (int x = 0; x < 16 && !ok; ++x)
+                {
+                    ok = GetPixel(memory, x, y) == RGB(0, 0, 0);
+                }
+            }
+
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            return ok;
+        }
     }
 
     bool init_button_rendering()
@@ -533,8 +599,7 @@ namespace gui::detail
         if (!g_gdiplus_probed)
         {
             g_gdiplus_probed = true;
-            g_gdiplus.module = LoadLibraryW(L"gdiplus.dll");
-            if (g_gdiplus.module != nullptr)
+            g_gdiplus.module = LoadLibraryW(L"gdiplus.dll");            if (g_gdiplus.module != nullptr)
             {
                 bool ok = true;
                 ok = g_gdiplus.bind(g_gdiplus.startup, "GdiplusStartup") && ok;
@@ -561,7 +626,13 @@ namespace gui::detail
                         BOOL suppress_background;
                         BOOL suppress_codecs;
                     } input{ 1, nullptr, FALSE, FALSE };
-                    g_gdiplus_ready = g_gdiplus.startup(&g_gdiplus_token, &input, nullptr) == 0;
+                    if (g_gdiplus.startup(&g_gdiplus_token, &input, nullptr) == 0)
+                    {
+                        // 起来了不等于画得出来：真画一笔自检，失败就一律走 GDI 兜底
+                        g_gdiplus_probing = true;
+                        g_gdiplus_ready = gdiplus_can_draw();
+                        g_gdiplus_probing = false;
+                    }
                 }
             }
         }

@@ -56,7 +56,6 @@ namespace gui::detail
         SendMessageW(ui().list, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(ui().list, nullptr, TRUE);
         update_button_states();
-        update_empty_hint();
     }
 
     void start_search()
@@ -78,7 +77,7 @@ namespace gui::detail
 
         ui().searching = true;
         set_busy(true);
-        update_empty_hint();   // 扫描期间把空态提示收起来
+        InvalidateRect(ui().list, nullptr, TRUE);   // 空态提示画在列表 WM_PAINT 里，扫描开始时刷掉
         ui().busy_started = GetTickCount();
         SetTimer(ui().window, BUSY_TIMER_ID, 500, nullptr);
         ui().worker_running.store(true);
@@ -192,7 +191,7 @@ namespace gui::detail
             ListView_DeleteAllItems(ui().list);
         }
         update_button_states();
-        update_empty_hint();
+        InvalidateRect(ui().list, nullptr, TRUE);
     }
 
     void add_app_target(const std::wstring& target)
