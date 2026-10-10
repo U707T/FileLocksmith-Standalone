@@ -29,7 +29,7 @@ namespace gui::detail
             text = L"把文件或文件夹拖到窗口里（也可以拖到 exe 图标上）";
             if (app::is_process_elevated())
             {
-                text += L"\n当前是管理员模式：若拖放无反应（UIPI），请用「文件 → 添加文件… / 添加文件夹…」";
+                text += L"\n当前是管理员模式：若拖放无反应（UIPI），请用「文件 → 检查文件… / 检查文件夹…」";
             }
         }
         else if (ui().paths.size() <= 2)
@@ -44,9 +44,22 @@ namespace gui::detail
         }
         SetWindowTextW(ui().path_label, text.c_str());
 
+        // 标题：一个路径时直接显示文件名（比"N 个路径"有信息量），空的时候保留标语
         std::wstring title = L"FileLocksmith";
-        title += ui().paths.empty() ? L" — 什么正在占用这个文件？"
-                                 : L" — " + std::to_wstring(ui().paths.size()) + L" 个路径";
+        if (ui().paths.empty())
+        {
+            title += L" — 什么正在占用这个文件？";
+        }
+        else if (ui().paths.size() == 1)
+        {
+            const auto& path = ui().paths[0];
+            const auto pos = path.find_last_of(L"\\/");
+            title += L" — " + (pos == std::wstring::npos ? path : path.substr(pos + 1));
+        }
+        else
+        {
+            title += L" — " + std::to_wstring(ui().paths.size()) + L" 个路径";
+        }
         if (app::is_process_elevated())
         {
             title += L"（管理员）";
@@ -81,14 +94,14 @@ namespace gui::detail
             return;
         }
 
-        const int name_width = 190;
-        const int pid_width = 80;
-        const int user_width = 140;
-        const int kind_width = 90;
-        int files_width = list_width - name_width - pid_width - user_width - kind_width - 30;
-        if (files_width < 120)
+        const int name_width = scale(190);
+        const int pid_width = scale(80);
+        const int user_width = scale(140);
+        const int kind_width = scale(90);
+        int files_width = list_width - name_width - pid_width - user_width - kind_width - scale(30);
+        if (files_width < scale(120))
         {
-            files_width = 120;
+            files_width = scale(120);
         }
         ListView_SetColumnWidth(ui().list, COL_PROCESS, name_width);
         ListView_SetColumnWidth(ui().list, COL_PID, pid_width);
@@ -97,25 +110,58 @@ namespace gui::detail
         ListView_SetColumnWidth(ui().list, COL_FILES, files_width);
     }
 
+    int scale(int value)
+    {
+        const int dpi = ui().dpi != 0 ? static_cast<int>(ui().dpi) : 96;
+        return MulDiv(value, dpi, 96);
+    }
+
+    int buttons_row_width()
+    {
+        int width = scale(10) * 2;   // 左右边距
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            if (kButtonSpec[i].starts_group && i > 0)
+            {
+                width += scale(22) - scale(6);   // 分组间距（多算的那一个普通 gap 要扣掉）
+            }
+            width += scale(kButtonSpec[i].width) + scale(6);
+        }
+        return width;
+    }
+
+    HWND button_by_id(int id)
+    {
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            if (kButtonSpec[i].id == id)
+            {
+                return ui().buttons[i];
+            }
+        }
+        return nullptr;
+    }
+
     void layout(HWND hwnd)
     {
         RECT client{};
         GetClientRect(hwnd, &client);
 
-        const int margin = 10;
-        const int gap = 6;
-        const int label_height = 46;
-        const int button_height = 30;
-        const int status_height = 22;
+        const int margin = scale(10);
+        const int gap = scale(6);
+        const int group_gap = scale(22);
+        const int label_height = scale(46);
+        const int button_height = scale(30);
+        const int status_height = scale(22);
 
         int y = margin;
         MoveWindow(ui().path_label, margin, y, client.right - 2 * margin, label_height, TRUE);
         y += label_height + gap;
 
         int remaining = client.bottom - y - button_height - status_height - margin - gap;
-        if (remaining < 60)
+        if (remaining < scale(60))
         {
-            remaining = 60;
+            remaining = scale(60);
         }
         MoveWindow(ui().list, margin, y, client.right - 2 * margin, remaining, TRUE);
         y += remaining + gap;
@@ -123,11 +169,16 @@ namespace gui::detail
         int x = margin;
         for (int i = 0; i < BUTTON_COUNT; ++i)
         {
-            MoveWindow(ui().buttons[i], x, y, kButtonSpec[i].width, button_height, TRUE);
-            x += kButtonSpec[i].width + gap;
+            if (kButtonSpec[i].starts_group && i > 0)
+            {
+                x += group_gap - gap;   // x 里已经含上一个按钮的 gap，补差即可
+            }
+            const int width = scale(kButtonSpec[i].width);
+            MoveWindow(ui().buttons[i], x, y, width, button_height, TRUE);
+            x += width + gap;
         }
 
-        MoveWindow(ui().status, margin, y + button_height + 2, client.right - 2 * margin, status_height, TRUE);
+        MoveWindow(ui().status, margin, y + button_height + scale(3), client.right - 2 * margin, status_height, TRUE);
 
         resize_columns(client.right - 2 * margin);
     }
@@ -264,29 +315,66 @@ namespace gui::detail
         return index;
     }
 
+    void init_list_extras()
+    {
+        // ListView 换成资源管理器风格（表头/选中高亮更现代）。uxtheme 是老系统就有的
+        // 系统 DLL，缺了也只是保持默认外观，不影响功能。
+        using SetWindowTheme_t = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+        static auto set_window_theme = load_proc<SetWindowTheme_t>(GetModuleHandleW(L"uxtheme.dll"), "SetWindowTheme");
+        if (set_window_theme != nullptr && ui().list != nullptr)
+        {
+            set_window_theme(ui().list, L"Explorer", nullptr);
+        }
+    }
+
+    void init_tooltips(HWND parent)
+    {
+        // "结束进程 / 强制解锁 / 删除" 三个动作的区别光看按钮文字分不出来，必须有悬停说明
+        ui().tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                       WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                                       CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                       parent, nullptr, ui().instance, nullptr);
+        if (ui().tooltip == nullptr)
+        {
+            return;
+        }
+
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            TOOLINFOW info{};
+            info.cbSize = sizeof(info);
+            info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            info.hwnd = parent;
+            info.uId = reinterpret_cast<UINT_PTR>(ui().buttons[i]);
+            info.lpszText = const_cast<wchar_t*>(kButtonSpec[i].tip);
+            SendMessageW(ui().tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+        }
+    }
+
     void update_button_states()
     {
+        const bool busy = ui().searching;
         const bool has_selection = !selected_rows().empty();
-        EnableWindow(ui().buttons[0], !ui().searching && has_selection);       // 结束进程
-        EnableWindow(ui().buttons[1], !ui().searching && !ui().results.empty());  // 全部结束
-        EnableWindow(ui().buttons[2], !ui().searching && !ui().results.empty());  // 强制解锁
-        EnableWindow(ui().buttons[3], !ui().searching && !ui().paths.empty());    // 删除文件
-        EnableWindow(ui().buttons[4], !ui().searching);                        // 重新检查
-        EnableWindow(ui().buttons[5], !ui().searching && has_selection);       // 打开所在位置
-        EnableWindow(ui().buttons[6], !ui().searching);                        // 以管理员身份重启
+
+        EnableWindow(button_by_id(IDC_KILL_SELECTED), !busy && has_selection);
+        EnableWindow(button_by_id(IDC_KILL_ALL), !busy && !ui().results.empty());
+        // 只有真的存在可关闭的文件句柄才让点"强制解锁"（纯模块映射点了什么也做不了）
+        EnableWindow(button_by_id(IDC_FORCE_UNLOCK), !busy && !ui().handles.empty());
+        EnableWindow(button_by_id(IDC_DELETE_FILES), !busy && !ui().paths.empty());
+        EnableWindow(button_by_id(IDC_REFRESH), !busy);
+        EnableWindow(button_by_id(IDC_OPEN_LOCATION), !busy && has_selection);
     }
 
     void update_menu_state()
     {
-        if (ui().main_menu == nullptr)
+        if (ui().tools_menu == nullptr)
         {
             return;
         }
-        if (HMENU file_menu = GetSubMenu(ui().main_menu, 0))
-        {
-            CheckMenuItem(file_menu, IDM_TOGGLE_CONTEXT_MENU,
-                          MF_BYCOMMAND | (shell_integration::is_context_menu_installed() ? MF_CHECKED : MF_UNCHECKED));
-        }
+        // 勾选状态每次弹出菜单时重新读注册表（可能在外部被改动）。
+        // 这里用的是 build_menu 存下来的子菜单句柄，不依赖"第几个子菜单"这种下标约定。
+        CheckMenuItem(ui().tools_menu, IDM_TOGGLE_CONTEXT_MENU,
+                      MF_BYCOMMAND | (shell_integration::is_context_menu_installed() ? MF_CHECKED : MF_UNCHECKED));
     }
 
     void build_menu(HWND hwnd)
@@ -300,19 +388,22 @@ namespace gui::detail
             return;
         }
 
-        AppendMenuW(file_menu, MF_STRING, IDM_TOGGLE_CONTEXT_MENU, L"添加到资源管理器右键菜单(&C)");
-        AppendMenuW(file_menu, MF_STRING, IDM_INSTALL_SENDTO, L"添加到「发送到」菜单(&S)");
-        AppendMenuW(file_menu, MF_STRING, IDM_OPEN_SENDTO, L"打开「发送到」文件夹(&O)");
-        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+        // 文件：只放"检查哪些文件"和"对当前检查做什么"
         AppendMenuW(file_menu, MF_STRING, IDM_ADD_FILES, L"检查文件…(&F)\tCtrl+O");
         AppendMenuW(file_menu, MF_STRING, IDM_ADD_FOLDER, L"检查文件夹…(&D)");
         AppendMenuW(file_menu, MF_STRING, IDM_APPEND_FILES, L"追加文件到当前检查…(&A)\tCtrl+Shift+O");
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_DELETE_FILES, L"删除检查的文件…(&E)");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"退出(&X)");
 
+        // 工具：重新检查 / 提权 / 资源管理器集成（"安装类"操作原来在「文件」菜单里，反直觉）
         AppendMenuW(tools_menu, MF_STRING, IDM_REFRESH, L"重新检查(&R)\tF5");
         AppendMenuW(tools_menu, MF_STRING, IDM_ELEVATE, L"以管理员身份重启(&A)");
+        AppendMenuW(tools_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(tools_menu, MF_STRING, IDM_TOGGLE_CONTEXT_MENU, L"资源管理器右键菜单(&C)");
+        AppendMenuW(tools_menu, MF_STRING, IDM_INSTALL_SENDTO, L"添加到「发送到」菜单(&S)");
+        AppendMenuW(tools_menu, MF_STRING, IDM_OPEN_SENDTO, L"打开「发送到」文件夹(&O)");
 
         AppendMenuW(help_menu, MF_STRING, IDM_ABOUT, L"关于 FileLocksmith(&A)");
         AppendMenuW(help_menu, MF_STRING, IDM_HOMEPAGE, L"项目主页 (GitHub)(&H)");
@@ -323,6 +414,7 @@ namespace gui::detail
 
         SetMenu(hwnd, menu);
         ui().main_menu = menu;
+        ui().tools_menu = tools_menu;
         update_menu_state();
     }
 
@@ -342,7 +434,7 @@ namespace gui::detail
         set_status(was_installed
                        ? L"已移除资源管理器右键菜单项。"
                        : L"已添加右键菜单项（文件 / 文件夹 / 驱动器 / 目录空白处，仅当前用户）。"
-                         L"Windows 11 要进“显示更多选项”才看得到；想出现在一级菜单请用「文件 → 添加到「发送到」菜单」。");
+                         L"Windows 11 要进“显示更多选项”才看得到；想出现在一级菜单请用「工具 → 添加到「发送到」菜单」。");
     }
 
     void add_sendto_menu()

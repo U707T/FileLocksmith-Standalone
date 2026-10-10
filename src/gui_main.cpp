@@ -51,7 +51,8 @@ namespace gui::detail
         case WM_CREATE:
             ui().window = hwnd;
             ui().post_target.store(hwnd);
-            ui().font = create_ui_font(window_dpi(hwnd));
+            ui().dpi = window_dpi(hwnd);
+            ui().font = create_ui_font(ui().dpi);
 
             ui().path_label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                            0, 0, 0, 0, hwnd, control_id(IDC_PATH_LABEL), ui().instance, nullptr);
@@ -79,6 +80,8 @@ namespace gui::detail
                 ui().buttons[i] = CreateWindowExW(0, L"BUTTON", kButtonSpec[i].text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                                0, 0, 0, 0, hwnd, control_id(kButtonSpec[i].id), ui().instance, nullptr);
             }
+            init_tooltips(hwnd);
+            init_list_extras();
 
             ui().status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
                                        0, 0, 0, 0, hwnd, control_id(IDC_STATUS), ui().instance, nullptr);
@@ -107,15 +110,11 @@ namespace gui::detail
 
         case WM_GETMINMAXINFO:
         {
-            // 按钮是固定宽度横排的，窗口缩得太小右侧按钮会被裁掉 —— 直接限制最小宽度
+            // 按钮是固定宽度横排的，窗口缩得太小右侧按钮会被裁掉 —— 直接限制最小宽度。
+            // 宽度算法与 layout() 共用 buttons_row_width()，不会再出现"两处算法漂移"。
             auto* info = reinterpret_cast<MINMAXINFO*>(l_param);
-            int buttons_width = 0;
-            for (int i = 0; i < BUTTON_COUNT; ++i)
-            {
-                buttons_width += kButtonSpec[i].width + 6;
-            }
-            info->ptMinTrackSize.x = buttons_width + 28;
-            info->ptMinTrackSize.y = 340;
+            info->ptMinTrackSize.x = buttons_row_width();
+            info->ptMinTrackSize.y = scale(340);
             return 0;
         }
 
@@ -125,14 +124,18 @@ namespace gui::detail
 
         case kDpiChangedMessage:
         {
-            // 拖到另一块不同缩放比的显示器：按新 DPI 重建字体，并按系统建议调整窗口大小
+            // 拖到另一块不同缩放比的显示器：按新 DPI 重建字体、更新布局缩放，并按系统建议调整窗口大小
             const UINT new_dpi = HIWORD(w_param);
+            if (new_dpi != 0)
+            {
+                ui().dpi = new_dpi;
+            }
             if (ui().font != nullptr)
             {
                 DeleteObject(ui().font);
                 ui().font = nullptr;
             }
-            ui().font = create_ui_font(new_dpi);
+            ui().font = create_ui_font(ui().dpi);
             apply_ui_font();
 
             const RECT* suggested = reinterpret_cast<const RECT*>(l_param);
@@ -155,7 +158,6 @@ namespace gui::detail
             case IDC_DELETE_FILES: delete_checked_paths(); return 0;
             case IDC_REFRESH: start_search(); return 0;
             case IDC_OPEN_LOCATION: open_file_location(); return 0;
-            case IDC_ELEVATE: restart_elevated(); return 0;
 
             case IDM_LIST_KILL: kill_selected(); return 0;
             case IDM_LIST_LOCATE: open_file_location(); return 0;
@@ -252,12 +254,24 @@ namespace gui::detail
             return TRUE;
         }
 
-        case WM_INITMENUPOPUP:
-            // 菜单里的勾选状态每次弹出时重新读一遍注册表（可能在外部被改动）
-            if (l_param == 0)
+        case WM_CTLCOLORSTATIC:
+        {
+            // 路径标签在"还没检查任何东西"时是引导文案，用灰色弱化；有内容时用正常文字色
+            auto control = reinterpret_cast<HWND>(l_param);
+            if (control == ui().path_label && ui().paths.empty())
             {
-                update_menu_state();
+                auto dc = reinterpret_cast<HDC>(w_param);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
             }
+            break;
+        }
+
+        case WM_INITMENUPOPUP:
+            // 菜单勾选状态每次弹出时重读注册表（可能在外部被改动）。
+            // 不判断 l_param 是哪个子菜单：update_menu_state 用的是存下来的子菜单句柄，不依赖下标。
+            update_menu_state();
             return 0;
 
         case WM_KEYDOWN:
@@ -365,7 +379,7 @@ namespace gui::detail
                 const auto unresolved = payload->locks.unresolved_paths.size();
                 if (!ui().handles_query_ok)
                 {
-                    set_status(L"句柄枚举失败：结果不可信，请点“以管理员身份重启”后重试。");
+                    set_status(L"句柄枚举失败：结果不可信，请在「工具」菜单里选「以管理员身份重启」后重试。");
                 }
                 else if (ui().results.empty())
                 {
@@ -478,7 +492,7 @@ namespace gui
 
         INITCOMMONCONTROLSEX controls{};
         controls.dwSize = sizeof(controls);
-        controls.dwICC = ICC_LISTVIEW_CLASSES;
+        controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;   // BAR：tooltip（按钮悬停提示）等
         InitCommonControlsEx(&controls);
 
         WNDCLASSEXW window_class{};
@@ -519,13 +533,13 @@ namespace gui
             SetFocus(ui().list);
             if (app::is_process_elevated())
             {
-                detail::set_status(L"管理员模式：若拖放没有反应（UIPI 限制），请用「文件 → 添加文件… / 添加文件夹…」，或把文件拖到 exe 图标上。");
+                detail::set_status(L"管理员模式：若拖放没有反应（UIPI 限制），请用「文件 → 检查文件… / 检查文件夹…」，或把文件拖到 exe 图标上。");
             }
             else
             {
                 detail::set_status(shell_integration::is_context_menu_installed()
                                ? L"把文件拖进来，或在资源管理器里右键 → 什么正在占用这个文件？"
-                               : L"提示: 还没添加右键菜单 —— 点上面的「文件」菜单 → 添加到资源管理器右键菜单。");
+                               : L"提示: 还没添加右键菜单 —— 打开「工具」菜单 → 资源管理器右键菜单。");
             }
         }
 

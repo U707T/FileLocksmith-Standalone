@@ -48,7 +48,7 @@ namespace gui::detail
         }
         else
         {
-            set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可点「以管理员身份重启」。");
+            set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可在「工具」菜单里选「以管理员身份重启」。");
         }
         start_search();
     }
@@ -82,7 +82,7 @@ namespace gui::detail
         }
         else
         {
-            set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可点击“以管理员身份重启”。");
+            set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可在「工具」菜单里选「以管理员身份重启」。");
         }
         start_search();
     }

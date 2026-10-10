@@ -27,7 +27,6 @@ namespace gui::detail
     constexpr int IDC_KILL_SELECTED = 1002;
     constexpr int IDC_KILL_ALL = 1003;
     constexpr int IDC_REFRESH = 1004;
-    constexpr int IDC_ELEVATE = 1005;
     constexpr int IDC_OPEN_LOCATION = 1006;
     constexpr int IDC_PATH_LABEL = 1007;
     constexpr int IDC_STATUS = 1008;
@@ -57,15 +56,17 @@ namespace gui::detail
         int id;
         const wchar_t* text;
         int width;
+        const wchar_t* tip;    // 悬停提示：三个"危险动作"的区别只靠文案是分不清的
+        bool starts_group;     // true = 与上一组之间留出分组间距（查看类动作另起一组）
     };
     inline constexpr ButtonSpec kButtonSpec[] = {
-        { IDC_KILL_SELECTED, L"结束进程", 110 },
-        { IDC_KILL_ALL, L"全部结束", 110 },
-        { IDC_FORCE_UNLOCK, L"强制解锁", 110 },
-        { IDC_DELETE_FILES, L"删除文件", 110 },
-        { IDC_REFRESH, L"重新检查", 90 },
-        { IDC_OPEN_LOCATION, L"打开所在位置", 140 },
-        { IDC_ELEVATE, L"以管理员身份重启", 170 },
+        // 左边一组 = 对结果的动作（都有确认框）；右边一组 = 查看类动作
+        { IDC_KILL_SELECTED, L"结束进程", 100, L"结束选中的进程（未保存的数据会丢失）", false },
+        { IDC_KILL_ALL, L"全部结束", 100, L"结束列表里的全部占用进程（不只是选中的）", false },
+        { IDC_FORCE_UNLOCK, L"强制解锁", 100, L"只关闭它们的文件句柄、不结束进程；持有句柄的程序可能出现异常", false },
+        { IDC_DELETE_FILES, L"删除检查的文件…", 170, L"删除正在检查的这些文件（进回收站；被占用时会单独问你一次）", false },
+        { IDC_REFRESH, L"重新检查", 90, L"重新扫描（F5）", true },
+        { IDC_OPEN_LOCATION, L"打开所在位置", 140, L"在资源管理器中定位选中的文件（双击列表也可以）", true },
     };
     constexpr int BUTTON_COUNT = static_cast<int>(sizeof(kButtonSpec) / sizeof(kButtonSpec[0]));
     constexpr UINT WM_FL_SEARCH_DONE = WM_APP + 1;
@@ -101,9 +102,12 @@ namespace gui::detail
         HWND list = nullptr;
         HWND status = nullptr;
         HWND path_label = nullptr;
+        HWND tooltip = nullptr;
         HWND buttons [BUTTON_COUNT] = {};
         HFONT font = nullptr;
         HMENU main_menu = nullptr;
+        HMENU tools_menu = nullptr;
+        UINT dpi = 96;
         HIMAGELIST icons = nullptr;
         std::map<std::wstring, int> icon_cache;
         ui_state::WindowState saved_state;
@@ -135,6 +139,14 @@ namespace gui::detail
     void add_paths(const std::vector<std::wstring>& new_paths);
     void add_sendto_menu();
     void apply_ui_font();
+    // 按窗口 DPI 缩放布局常量（字体早就按 DPI 建了，布局此前是固定像素）
+    int scale(int value);
+    // 按钮行需要的总宽度（含边距与分组间距），布局与最小窗口尺寸共用同一份算法
+    int buttons_row_width();
+    // 按控件 ID 找按钮：避免"数组下标 = 语义"的隐式耦合（改一次按钮表就可能错位）
+    HWND button_by_id(int id);
+    void init_list_extras();
+    void init_tooltips(HWND parent);
     void build_menu(HWND hwnd);
     // 控件 ID 通过 CreateWindowExW 的 HMENU 参数传递；经 INT_PTR 中转以满足 64 位 MSVC（C4312）
     inline HMENU control_id(int id)
