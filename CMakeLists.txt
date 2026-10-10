@@ -22,7 +22,10 @@ add_executable(FileLocksmith WIN32
     src/main.cpp
     src/app_utils.cpp
     src/cli.cpp
-    src/gui.cpp
+    src/gui_chrome.cpp
+    src/gui_search.cpp
+    src/gui_actions.cpp
+    src/gui_main.cpp
     src/shell_integration.cpp
     src/ui_state.cpp
     src/file_locksmith.cpp

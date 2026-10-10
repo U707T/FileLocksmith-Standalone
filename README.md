@@ -72,7 +72,12 @@ FileLocksmith-Standalone/
 │   ├── process_result.h        # 结果结构（原样）
 │   ├── app_utils.{h,cpp}       # 控制台/提权/结束进程等 Win32 工具
 │   ├── cli.{h,cpp}             # 命令行模式
-│   ├── gui.{h,cpp}             # Win32 图形界面（新增，替代 WinUI 3）
+│   ├── gui.h                   # 图形界面对外入口（gui::run）
+│   ├── gui_internal.h          # GUI 内部共享声明：常量、UiState、各文件函数
+│   ├── gui_chrome.cpp          # 窗口/控件/布局/字体与 DPI/菜单/图标/状态栏（349 行）
+│   ├── gui_search.cpp          # 扫描线程、路径收集、结果填充（195 行）
+│   ├── gui_actions.cpp         # 结束/解锁/删除/定位/复制/文件对话框（502 行）
+│   ├── gui_main.cpp            # 窗口过程与程序入口（514 行）
 │   ├── shell_integration.{h,cpp} # 资源管理器集成：右键菜单注册 / 「发送到」快捷方式（CLI 与 GUI 共用）
 │   └── main.cpp                # 入口：自动决定命令行还是图形界面
 └── dist/FileLocksmith.exe      # 本地构建产物（被 .gitignore 忽略，仓库不放二进制）
@@ -286,10 +291,7 @@ Win11 的「发送到」在**一级菜单**里，比传统 verb 少点一步。
    按钮点击、拖放、列表交互这些只能靠手点 —— 「打开所在位置」按钮的 ID 串位 bug 就是这么漏出去的，
    1.1.0 已修（见 CHANGELOG）。
 6. **不做持久化**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
-7. **`gui.cpp` 的结构债**：**1686 行**、背着 UI/动作/线程/菜单四类职责，超本项目 1000 行红线近 70%。
-   拆分方案：`gui_actions.*`（结束/解锁/删除/定位）、`gui_chrome.*`（窗口/控件/布局/菜单/字体与 DPI）、
-   `gui_main.cpp`（窗口过程与消息分发），共享 `GuiContext`。单独一次提交做，避免与功能改动混合。
-8. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
+7. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
    放在冒烟测试里 —— CI 的 `windows-2022` job 会真的创建一个被独占占用的文件，断言 exe 能报出
    占用者的 PID 与用户名；再用 `--kill` 断言占用进程被结束；用 `--unlock` 断言文件被解锁
    而持有它的进程仍然活着。GUI 窗口的交互（点击、拖放）CI 覆盖不到，有问题请提 issue。
