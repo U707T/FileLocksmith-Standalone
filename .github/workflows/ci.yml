@@ -45,6 +45,11 @@ jobs:
           Write-Host "--version 输出: $actual"
           if ($actual -notmatch [regex]::Escape($expected)) { throw "版本号不一致" }
       # 真机端到端自测：找占用者 + 结束占用者
+      # 真机端到端自测：找占用者 + 结束占用者
+      #
+      # 注意：exe 是 Windows 子系统（双击不闪控制台）。PowerShell 7 用 `& exe` 直接调用时
+      # 会把它判定为图形程序 —— 不等待、也不捕获输出（$LASTEXITCODE 为空）。所以这里统一
+      # 用 Start-Process 重定向到文件，行为完全确定。
       - name: Functional test (真实占用检测 + 结束占用进程)
         shell: pwsh
         run: |
@@ -55,20 +60,34 @@ jobs:
           $file = Join-Path $dir 'locked.txt'
           Set-Content -Path $file -Value 'hello'
 
+          function Invoke-FL {
+            param([string[]]$Arguments)
+            $outFile = New-TemporaryFile
+            $errFile = New-TemporaryFile
+            $p = Start-Process -FilePath $exe -ArgumentList $Arguments -NoNewWindow -Wait -PassThru `
+                 -RedirectStandardOutput $outFile.FullName -RedirectStandardError $errFile.FullName
+            $stdout = Get-Content $outFile.FullName -Raw -Encoding UTF8
+            $stderr = Get-Content $errFile.FullName -Raw -Encoding UTF8
+            Remove-Item $outFile.FullName, $errFile.FullName -Force -ErrorAction SilentlyContinue
+            if ($null -eq $stdout) { $stdout = '' }
+            if ($null -eq $stderr) { $stderr = '' }
+            [pscustomobject]@{ ExitCode = $p.ExitCode; StdOut = $stdout; StdErr = $stderr }
+          }
+
           # --- 用例 1：当前 PowerShell 进程独占持有文件句柄 ---
-          $stream = [System.IO.File]::Open($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+          $stream = [System.IO.File]::Open($file, 'Open', 'ReadWrite', 'None')
           Write-Host "用例 1：本进程 PID = $PID 独占占用 $file"
-          $raw = & $exe $file --json
-          $code = $LASTEXITCODE
-          $json = ($raw | Out-String)
-          Write-Host "FileLocksmith 输出: $json"
+          $r = Invoke-FL @($file, '--json', '--cli')
           $stream.Close()
           $stream.Dispose()
-          if ($code -ne 0) { throw "退出码 $code" }
-          if ($json -notmatch '"pid"\s*:\s*' + $PID + '\b') { throw "未检测到占用者 PID $PID" }
+          Write-Host "  退出码: $($r.ExitCode)"
+          Write-Host "  stdout: $($r.StdOut.Trim())"
+          if ($r.StdErr) { Write-Host "  stderr: $($r.StdErr.Trim())" }
+          if ($r.ExitCode -ne 0) { throw "用例 1 失败：退出码 $($r.ExitCode)" }
+          if ($r.StdOut -notmatch '"pid"\s*:\s*' + $PID + '\b') { throw "用例 1 失败：未检测到占用者 PID $PID" }
           Write-Host "用例 1 通过：检测到占用进程 $PID"
 
-          # --- 用例 2：另外一个进程持有句柄，用 --kill 结束它 ---
+          # --- 用例 2：另一个进程持有句柄，应能被检测到，并被 --kill 结束 ---
           $blocker = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
             '-NoProfile','-NonInteractive','-Command',
             "`$f=[System.IO.File]::Open('$file','Open','ReadWrite','None'); Start-Sleep -Seconds 300"
@@ -77,25 +96,31 @@ jobs:
           $found = $false
           for ($i = 0; $i -lt 6; $i++) {
             Start-Sleep -Seconds 5
-            $json2 = (& $exe $file --json | Out-String)
-            if ($json2 -match '"pid"\s*:\s*' + $blocker.Id + '\b') { $found = $true; break }
+            $r2 = Invoke-FL @($file, '--json', '--cli')
+            Write-Host "  第 $($i+1) 次查询 stdout: $($r2.StdOut.Trim())"
+            if ($r2.StdOut -match '"pid"\s*:\s*' + $blocker.Id + '\b') { $found = $true; break }
           }
           if (-not $found) {
             Stop-Process -Id $blocker.Id -Force -ErrorAction SilentlyContinue
-            throw "未检测到阻塞进程 $($blocker.Id)，输出：$json2"
+            throw "用例 2 失败：未检测到阻塞进程 $($blocker.Id)"
           }
-          Write-Host "用例 2 通过：检测到阻塞进程"
+          Write-Host "用例 2 通过：检测到阻塞进程 $($blocker.Id)"
 
-          & $exe $file --kill | Out-Null
+          $r3 = Invoke-FL @($file, '--kill', '--cli')
+          Write-Host "  --kill stdout: $($r3.StdOut.Trim())"
           Start-Sleep -Seconds 3
           if (-not $blocker.HasExited) {
             Stop-Process -Id $blocker.Id -Force -ErrorAction SilentlyContinue
-            throw "--kill 没有结束掉阻塞进程"
+            throw "用例 2 失败：--kill 没有结束掉阻塞进程"
           }
-          Write-Host "用例 2 通过：--kill 已结束阻塞进程"
+          Write-Host "用例 2 通过：--kill 已结束阻塞进程 $($blocker.Id)"
 
-          $remaining = (& $exe $file --json | Out-String)
-          Write-Host "清理后查询：$remaining"
+          # --- 用例 3：解锁后不应再报占用 ---
+          Start-Sleep -Seconds 2
+          $r4 = Invoke-FL @($file, '--json', '--cli')
+          Write-Host "用例 3 查询 stdout: $($r4.StdOut.Trim())"
+          if ($r4.StdOut -match '"pid"') { throw "用例 3 失败：进程都结束了却仍报告占用" }
+          Write-Host "用例 3 通过：无占用"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
