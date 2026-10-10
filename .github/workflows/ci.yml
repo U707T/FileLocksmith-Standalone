@@ -178,14 +178,19 @@ jobs:
           $r6 = Invoke-FL @('--register', '--cli')
           Write-Host "  --register stdout: $($r6.StdOut.Trim())"
           if ($r6.ExitCode -ne 0) { throw "用例 5 失败：--register 退出码 $($r6.ExitCode)" }
-          if (-not (Test-Path $menuKey)) { throw "用例 5 失败：注册后 $menuKey 不存在" }
-          $command = (Get-Item "$menuKey\command").GetValue('')
+          # 注意：路径里有 `*`，PowerShell 的注册表 provider 会当通配符，必须用 -LiteralPath
+          if (-not (Test-Path -LiteralPath $menuKey)) { throw "用例 5 失败：注册后 $menuKey 不存在" }
+          $command = (Get-Item -LiteralPath "$menuKey\command").GetValue('')
           Write-Host "  注册的命令: $command"
-          if ($command -notmatch [regex]::Escape('FileLocksmith-x64.exe')) { throw "用例 5 失败：命令没指向本 exe" }
-          if (-not (Test-Path 'HKCU:\Software\Classes\Directory\shell\FileLocksmith')) { throw "用例 5 失败：文件夹右键没注册" }
-          if (-not (Test-Path 'HKCU:\Software\Classes\Directory\Background\shell\FileLocksmith')) { throw "用例 5 失败：目录空白处右键没注册" }
+          if ($command -notmatch [regex]::Escape('FileLocksmith-x64.exe')) { throw "用例 5 失败：命令没指向本 exe，实际是 '$command'" }
+          if ($command -notmatch [regex]::Escape('"%1"')) { throw "用例 5 失败：命令里没有 %1 参数" }
+          if (-not (Test-Path -LiteralPath 'HKCU:\Software\Classes\Directory\shell\FileLocksmith')) { throw "用例 5 失败：文件夹右键没注册" }
+          if (-not (Test-Path -LiteralPath 'HKCU:\Software\Classes\Directory\Background\shell\FileLocksmith')) { throw "用例 5 失败：目录空白处右键没注册" }
+          $backgroundCommand = (Get-Item -LiteralPath 'HKCU:\Software\Classes\Directory\Background\shell\FileLocksmith\command').GetValue('')
+          Write-Host "  目录空白处的命令: $backgroundCommand"
+          if ($backgroundCommand -notmatch [regex]::Escape('%V')) { throw "用例 5 失败：目录空白处应该用 %V 而不是 %1" }
           $r7 = Invoke-FL @('--unregister', '--cli')
-          if (Test-Path $menuKey) { throw "用例 5 失败：--unregister 之后注册表项还在" }
+          if (Test-Path -LiteralPath $menuKey) { throw "用例 5 失败：--unregister 之后注册表项还在" }
           Write-Host "用例 5 通过：右键菜单可以开启 / 关闭，命令指向正确的 exe"
 
           # --- 用例 6：「发送到」快捷方式（走 IShellLink COM 那条路）---
