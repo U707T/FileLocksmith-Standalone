@@ -58,18 +58,17 @@ namespace gui::detail
     {
         int id;
         const wchar_t* text;
-        int width;
         const wchar_t* tip;    // 悬停提示：三个"危险动作"的区别只靠文案是分不清的
-        bool starts_group;     // true = 与上一组之间留出分组间距（查看类动作另起一组）
+        bool starts_group;     // true = 归入"查看类"右组（宽度按文字实测，不再写死）
     };
     inline constexpr ButtonSpec kButtonSpec[] = {
-        // 左边一组 = 对结果的动作（都有确认框）；右边一组 = 查看类动作
-        { IDC_KILL_SELECTED, L"结束进程", 100, L"结束选中的进程（未保存的数据会丢失）", false },
-        { IDC_KILL_ALL, L"全部结束", 100, L"结束列表里的全部占用进程（不只是选中的）", false },
-        { IDC_FORCE_UNLOCK, L"强制解锁", 100, L"只关闭它们的文件句柄、不结束进程；持有句柄的程序可能出现异常", false },
-        { IDC_DELETE_FILES, L"删除检查的文件…", 170, L"删除正在检查的这些文件（进回收站；被占用时会单独问你一次）", false },
-        { IDC_REFRESH, L"重新检查", 90, L"重新扫描（F5）", true },
-        { IDC_OPEN_LOCATION, L"打开所在位置", 140, L"在资源管理器中定位选中的文件（双击列表也可以）", true },
+        // 左组 = 对结果的动作（都有确认框）；右组 = 查看类，布局时贴右边缘
+        { IDC_KILL_SELECTED, L"结束进程", L"结束选中的进程（未保存的数据会丢失）", false },
+        { IDC_KILL_ALL, L"全部结束", L"结束列表里的全部占用进程（不只是选中的）", false },
+        { IDC_FORCE_UNLOCK, L"强制解锁", L"只关闭它们的文件句柄、不结束进程；持有句柄的程序可能出现异常", false },
+        { IDC_DELETE_FILES, L"删除检查的文件…", L"删除正在检查的这些文件（进回收站；被占用时会单独问你一次）", false },
+        { IDC_REFRESH, L"重新检查", L"重新扫描（F5）", true },
+        { IDC_OPEN_LOCATION, L"打开所在位置", L"在资源管理器中定位选中的文件（双击列表也可以）", true },
     };
     constexpr int BUTTON_COUNT = static_cast<int>(sizeof(kButtonSpec) / sizeof(kButtonSpec[0]));
     constexpr UINT WM_FL_SEARCH_DONE = WM_APP + 1;
@@ -110,6 +109,7 @@ namespace gui::detail
         HWND empty_hint = nullptr;
         HWND tooltip = nullptr;
         HWND buttons [BUTTON_COUNT] = {};
+        int button_widths [BUTTON_COUNT] = {};   // 按文字实测（compute_button_widths）
         HFONT font = nullptr;
         HFONT headline_font = nullptr;
         HICON header_icon_handle = nullptr;
@@ -149,7 +149,9 @@ namespace gui::detail
     void apply_ui_font();
     // 按窗口 DPI 缩放布局常量（字体早就按 DPI 建了，布局此前是固定像素）
     int scale(int value);
-    // 按钮行需要的总宽度（含边距与分组间距），布局与最小窗口尺寸共用同一份算法
+    // 按钮宽度 = 文字实测宽度 + 两侧内边距（含 DPI/字体缩放），改字体或 DPI 后要重算
+    void compute_button_widths();
+    // 按钮行需要的总宽度（左组 + 右组 + 边距），布局与最小窗口尺寸共用同一份算法
     int buttons_row_width();
     // 按控件 ID 找按钮：避免"数组下标 = 语义"的隐式耦合（改一次按钮表就可能错位）
     HWND button_by_id(int id);

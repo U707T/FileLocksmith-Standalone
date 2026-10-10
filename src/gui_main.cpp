@@ -100,6 +100,7 @@ namespace gui::detail
             }
             init_tooltips(hwnd);
             init_list_extras();
+            compute_button_widths();
 
             ui().status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
                                        0, 0, 0, 0, hwnd, control_id(IDC_STATUS), ui().instance, nullptr);
@@ -132,8 +133,12 @@ namespace gui::detail
             // 按钮是固定宽度横排的，窗口缩得太小右侧按钮会被裁掉 —— 直接限制最小宽度。
             // 宽度算法与 layout() 共用 buttons_row_width()，不会再出现"两处算法漂移"。
             auto* info = reinterpret_cast<MINMAXINFO*>(l_param);
+            if (ui().button_widths[0] == 0)
+            {
+                compute_button_widths();   // WM_GETMINMAXINFO 可能早于 WM_CREATE 到达
+            }
             info->ptMinTrackSize.x = buttons_row_width();
-            info->ptMinTrackSize.y = scale(340);
+            info->ptMinTrackSize.y = scale(300);
             return 0;
         }
 
@@ -162,6 +167,7 @@ namespace gui::detail
             ui().font = create_ui_font(ui().dpi);
             ui().headline_font = create_ui_font(ui().dpi, FW_SEMIBOLD);
             apply_ui_font();
+            compute_button_widths();
 
             const RECT* suggested = reinterpret_cast<const RECT*>(l_param);
             if (suggested != nullptr)
@@ -544,8 +550,11 @@ namespace gui
         ui().saved_state = ui_state::load();
         const int window_x = ui().saved_state.x != INT_MIN ? ui().saved_state.x : CW_USEDEFAULT;
         const int window_y = ui().saved_state.y != INT_MIN ? ui().saved_state.y : CW_USEDEFAULT;
-        const int window_width = ui().saved_state.width > 480 ? ui().saved_state.width : 980;
-        const int window_height = ui().saved_state.height > 320 ? ui().saved_state.height : 620;
+        // 默认尺寸按内容给：空着启动时不需要一块 900×600 的大白板；有路径时把列表留足
+        const int default_width = 860;
+        const int default_height = ui().paths.empty() ? 460 : 620;
+        const int window_width = ui().saved_state.width > 480 ? ui().saved_state.width : default_width;
+        const int window_height = ui().saved_state.height > 320 ? ui().saved_state.height : default_height;
 
         HWND window = CreateWindowExW(0, WndClassName, WindowTitle, WS_OVERLAPPEDWINDOW,
                                       window_x, window_y, window_width, window_height,

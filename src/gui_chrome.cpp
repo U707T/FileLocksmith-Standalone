@@ -140,18 +140,48 @@ namespace gui::detail
         return MulDiv(value, dpi, 96);
     }
 
-    int buttons_row_width()
+    int pixel_width_of_text(const wchar_t* text)
     {
-        int width = scale(12) * 2;   // 左右边距（与 layout() 保持一致）
+        HDC dc = GetDC(ui().window);
+        if (dc == nullptr)
+        {
+            return 0;
+        }
+        HGDIOBJ previous = SelectObject(dc, ui().font != nullptr ? ui().font : GetStockObject(DEFAULT_GUI_FONT));
+        SIZE size{};
+        GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &size);
+        SelectObject(dc, previous);
+        ReleaseDC(ui().window, dc);
+        return size.cx;
+    }
+
+    void compute_button_widths()
+    {
+        // 宽度按文字实测（不再写死 100/170/90 那种）—— 一行里宽窄不一，看起来就是"没对齐"。
+        // 字体或 DPI 变了要重算（WM_CREATE / WM_DPICHANGED 里调用）。
         for (int i = 0; i < BUTTON_COUNT; ++i)
         {
-            if (kButtonSpec[i].starts_group && i > 0)
-            {
-                width += scale(30) - scale(8);   // 分组间距（多算的那一个普通 gap 要扣掉）
-            }
-            width += scale(kButtonSpec[i].width) + scale(8);
+            const int width = pixel_width_of_text(kButtonSpec[i].text) + scale(14) * 2;
+            const int minimum = scale(76);
+            ui().button_widths[i] = width < minimum ? minimum : width;
         }
-        return width;
+    }
+
+    int buttons_row_width()
+    {
+        auto group_width = [](bool view_group) {
+            int total = 0;
+            for (int i = 0; i < BUTTON_COUNT; ++i)
+            {
+                if (kButtonSpec[i].starts_group == view_group)
+                {
+                    total += ui().button_widths[i] + scale(8);
+                }
+            }
+            return total;
+        };
+        // 左组 + 两组之间最少的留白 + 右组 + 左右边距
+        return scale(12) * 2 + group_width(false) + scale(24) + group_width(true);
     }
 
     HWND button_by_id(int id)
@@ -173,12 +203,11 @@ namespace gui::detail
 
         const int margin = scale(12);
         const int gap = scale(8);
-        const int group_gap = scale(30);
         const int icon_size = scale(32);
         const int headline_height = scale(22);
         const int subline_height = scale(20);
         const int header_height = scale(56);
-        const int button_height = scale(30);
+        const int button_height = scale(32);
         const int status_height = scale(22);
 
         // 头部：图标 + 半粗标题 + 灰色副标题（三行信息，取代原来一行 12px 小字）
@@ -209,15 +238,18 @@ namespace gui::detail
         y += remaining + gap + scale(4);
 
         int x = margin;
-        for (int i = 0; i < BUTTON_COUNT; ++i)
+        for (int i = 0; i < BUTTON_COUNT && !kButtonSpec[i].starts_group; ++i)
         {
-            if (kButtonSpec[i].starts_group && i > 0)
-            {
-                x += group_gap - gap;   // x 里已经含上一个按钮的 gap，补差即可
-            }
-            const int width = scale(kButtonSpec[i].width);
-            MoveWindow(ui().buttons[i], x, y, width, button_height, TRUE);
-            x += width + gap;
+            MoveWindow(ui().buttons[i], x, y, ui().button_widths[i], button_height, TRUE);
+            x += ui().button_widths[i] + gap;
+        }
+        // 右组（查看类）贴住右边缘：中间留白由窗口宽度吸收，不会只在左边挤成一串
+        x = client.right - margin;
+        for (int i = BUTTON_COUNT - 1; i >= 0 && kButtonSpec[i].starts_group; --i)
+        {
+            x -= ui().button_widths[i];
+            MoveWindow(ui().buttons[i], x, y, ui().button_widths[i], button_height, TRUE);
+            x -= gap;
         }
 
         MoveWindow(ui().status, margin, y + button_height + scale(4), client.right - 2 * margin, status_height, TRUE);
