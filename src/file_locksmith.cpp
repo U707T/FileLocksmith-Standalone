@@ -14,7 +14,7 @@ static constexpr bool starts_with(std::wstring_view whole, std::wstring_view par
     return whole.size() >= part.size() && whole.substr(0, part.size()) == part;
 }
 
-LocksmithResult find_locks(const std::vector<std::wstring>& paths)
+LocksmithResult find_locks(const std::vector<std::wstring>& paths, bool include_modules)
 {
     NtdllExtensions nt_ext;
 
@@ -90,6 +90,11 @@ LocksmithResult find_locks(const std::vector<std::wstring>& paths)
 
     for (const auto& process : processes)
     {
+        if (!include_modules)
+        {
+            break;
+        }
+
         for (const auto& path : process.modules)
         {
             auto kernel_name = nt_ext.path_to_kernel_name(path.c_str());

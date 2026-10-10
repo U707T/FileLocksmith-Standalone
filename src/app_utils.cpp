@@ -7,7 +7,9 @@ namespace app
     namespace
     {
         HANDLE g_out = NULL;
+        HANDLE g_err = NULL;
         bool g_out_is_console = false;
+        bool g_err_is_console = false;
         bool g_own_console = false;
         bool g_setup_done = false;
 
@@ -46,6 +48,8 @@ namespace app
             {
                 g_out = h;
                 g_out_is_console = true;
+                g_err = GetStdHandle(STD_ERROR_HANDLE);
+                g_err_is_console = true;
                 return true;
             }
             if (GetFileType(h) != FILE_TYPE_UNKNOWN)
@@ -53,6 +57,8 @@ namespace app
                 // stdout is redirected to a file or pipe: keep it.
                 g_out = h;
                 g_out_is_console = false;
+                g_err = GetStdHandle(STD_ERROR_HANDLE);
+                g_err_is_console = false;
                 return true;
             }
         }
@@ -79,6 +85,11 @@ namespace app
             g_own_console = true;
             if (try_open_conout())
             {
+                if (g_err == NULL)
+                {
+                    g_err = g_out;
+                    g_err_is_console = g_out_is_console;
+                }
                 return true;
             }
         }
@@ -95,23 +106,44 @@ namespace app
         return g_out_is_console;
     }
 
+    namespace
+    {
+        void write_to(HANDLE handle, bool is_console, const std::wstring& text)
+        {
+            if (handle == NULL || text.empty())
+            {
+                return;
+            }
+
+            if (is_console)
+            {
+                DWORD written = 0;
+                WriteConsoleW(handle, text.c_str(), static_cast<DWORD>(text.size()), &written, NULL);
+            }
+            else
+            {
+                auto utf8 = to_utf8(text);
+                DWORD written = 0;
+                WriteFile(handle, utf8.data(), static_cast<DWORD>(utf8.size()), &written, NULL);
+            }
+        }
+    }
+
     void out(const std::wstring& text)
     {
-        if (g_out == NULL || text.empty())
-        {
-            return;
-        }
+        write_to(g_out, g_out_is_console, text);
+    }
 
-        if (g_out_is_console)
+    void err(const std::wstring& text)
+    {
+        // 没单独拿到 stderr（例如同一个控制台句柄）时退回 stdout，别把消息丢了
+        if (g_err != NULL)
         {
-            DWORD written = 0;
-            WriteConsoleW(g_out, text.c_str(), static_cast<DWORD>(text.size()), &written, NULL);
+            write_to(g_err, g_err_is_console, text);
         }
         else
         {
-            auto utf8 = to_utf8(text);
-            DWORD written = 0;
-            WriteFile(g_out, utf8.data(), static_cast<DWORD>(utf8.size()), &written, NULL);
+            write_to(g_out, g_out_is_console, text);
         }
     }
 

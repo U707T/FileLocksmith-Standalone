@@ -209,6 +209,25 @@ jobs:
           if ($r9.StdOut -notmatch '"unresolved"') { throw "用例 7 失败：JSON 里没有 unresolved 字段" }
           if ($r9.StdOut -notmatch 'does-not-exist') { throw "用例 7 失败：没有报出无效路径" }
           Write-Host "用例 7 通过：无效路径会被明确报出"
+
+          # --- 用例 8：--json 的 stdout 必须只有 JSON（诊断信息走 stderr）---
+          $blocker3 = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile','-NonInteractive','-Command',
+            "`$f=[System.IO.File]::Open('$file','Open','ReadWrite','None'); Start-Sleep -Seconds 300"
+          )
+          Start-Sleep -Seconds 5
+          $r10 = Invoke-FL @($file, '--json', '--unlock', '--cli')
+          Write-Host "  stdout: $($r10.StdOut.Trim())"
+          Write-Host "  stderr: $($r10.StdErr.Trim())"
+          Stop-Process -Id $blocker3.Id -Force -ErrorAction SilentlyContinue
+          try {
+            $null = $r10.StdOut.Trim() | ConvertFrom-Json
+          } catch {
+            throw "用例 8 失败：--json 的 stdout 不是合法 JSON —— $_"
+          }
+          if ($r10.StdOut.Trim() -notmatch '^\{.*\}$') { throw "用例 8 失败：stdout 里混进了非 JSON 内容" }
+          if ($r10.StdErr -notmatch '已强制关闭') { throw "用例 8 失败：诊断信息没有走 stderr" }
+          Write-Host "用例 8 通过：stdout 只有一行 JSON，诊断信息在 stderr"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

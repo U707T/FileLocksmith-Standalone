@@ -26,7 +26,10 @@ struct LocksmithResult
 };
 
 // Second version, checks handles towards files and all subfiles and folders of given dirs, if any.
-LocksmithResult find_locks(const std::vector<std::wstring>& paths);
+//
+// include_modules=false 时跳过"枚举每个进程的模块"这一步：慢的那部分就是它。
+// --wait 的轮询用它做廉价检查，真正判定解锁前再跑一次完整的。
+LocksmithResult find_locks(const std::vector<std::wstring>& paths, bool include_modules = true);
 
 // 兼容接口：只要进程列表。
 std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstring>& paths);

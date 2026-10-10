@@ -6,6 +6,8 @@
 #include "shell_integration.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <version.h>
 
 namespace
@@ -32,6 +34,11 @@ namespace
     constexpr int IDM_ABOUT = 2006;
     constexpr int IDM_HOMEPAGE = 2007;
     constexpr int IDM_EXIT = 2008;
+    constexpr int IDM_ADD_FILES = 2009;
+    constexpr int IDM_ADD_FOLDER = 2010;
+
+    // 子控件转发拖放用的 subclass id
+    constexpr UINT_PTR DROP_SUBCLASS_ID = 1;
 
     // 按钮：ID / 文字 / 宽度。以前是按 “IDC_KILL_SELECTED + 序号” 分配 ID 的，
     // 顺序和常量对不上，导致“打开所在位置”实际会触发“以管理员身份重启”，
@@ -66,6 +73,10 @@ namespace
     HMENU g_main_menu = nullptr;
 
     bool g_searching = false;
+    // 搜索进行中又来了新路径（拖放经常接着上一轮）时，等这轮结束再查一次
+    bool g_search_pending = false;
+    // 后台枚举线程是否还在跑：退出时用它等一小会儿，避免线程还在系统调用里就拆 CRT
+    std::atomic<bool> g_worker_running{ false };
     // Written by the UI thread, read by the worker thread that posts results.
     std::atomic<HWND> g_post_target{ nullptr };
     std::vector<std::wstring> g_paths;
@@ -111,10 +122,20 @@ namespace
         if (g_paths.empty())
         {
             text = L"把文件或文件夹拖到窗口里（也可以拖到 exe 图标上）";
+            if (app::is_process_elevated())
+            {
+                text += L"\n当前是管理员模式：Windows 不允许从资源管理器拖放到提权窗口，请用「文件 → 添加文件…」";
+            }
+        }
+        else if (g_paths.size() <= 2)
+        {
+            text = L"正在检查: " + join(g_paths, L"\n");
         }
         else
         {
-            text = L"正在检查: " + join(g_paths, L"\n");
+            // 标签只有两行高，路径多了要收敛，不然用户以为只查了前面的
+            text = L"正在检查 " + std::to_wstring(g_paths.size()) + L" 个路径: " + g_paths[0] +
+                   L"、" + g_paths[1] + L" …";
         }
         SetWindowTextW(g_path_label, text.c_str());
     }
@@ -218,6 +239,73 @@ namespace
         resize_columns(client.right - 2 * margin);
     }
 
+    // 系统控件（列表、静态文字、按钮）自己不处理 WM_DROPFILES：给它们也注册拖放，
+    // 收到后转给主窗口。少了这一步，把文件"拖到列表区域"是完全没有反应的。
+    LRESULT CALLBACK drop_subclass_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data)
+    {
+        if (message == WM_DROPFILES)
+        {
+            if (g_window != nullptr && g_window != hwnd)
+            {
+                SendMessageW(g_window, WM_DROPFILES, w_param, l_param);
+                return 0;
+            }
+        }
+        else if (message == WM_NCDESTROY)
+        {
+            RemoveWindowSubclass(hwnd, drop_subclass_proc, subclass_id);
+        }
+
+        return DefSubclassProc(hwnd, message, w_param, l_param);
+    }
+
+    // WM_DPICHANGED 在 _WIN32_WINNT < 0x0603 的头文件里没有定义，自己写常量
+    constexpr UINT kDpiChangedMessage = 0x02E0;
+
+    UINT window_dpi(HWND hwnd)
+    {
+        using GetDpiForWindow_t = UINT(WINAPI*)(HWND);
+        static auto get_dpi = reinterpret_cast<GetDpiForWindow_t>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+        return (get_dpi != nullptr && hwnd != nullptr) ? get_dpi(hwnd) : 0;
+    }
+
+    HFONT create_ui_font(UINT dpi)
+    {
+        NONCLIENTMETRICSW metrics{};
+        metrics.cbSize = sizeof(metrics);
+
+        // SystemParametersInfoForDpi 是 Win10 1607+（5 个参数），老系统退回普通版
+        using SystemParametersInfoForDpi_t = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+        static auto spi_for_dpi = reinterpret_cast<SystemParametersInfoForDpi_t>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+
+        bool ok = false;
+        if (spi_for_dpi != nullptr && dpi != 0)
+        {
+            ok = spi_for_dpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi) != 0;
+        }
+        if (!ok)
+        {
+            ok = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0) != 0;
+        }
+        return ok ? CreateFontIndirectW(&metrics.lfMessageFont) : nullptr;
+    }
+
+    void apply_ui_font()
+    {
+        if (g_font == nullptr)
+        {
+            return;
+        }
+        SendMessageW(g_path_label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        SendMessageW(g_list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            SendMessageW(g_buttons[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        }
+    }
+
     void update_menu_state()
     {
         if (g_main_menu == nullptr)
@@ -245,6 +333,9 @@ namespace
         AppendMenuW(file_menu, MF_STRING, IDM_TOGGLE_CONTEXT_MENU, L"添加到资源管理器右键菜单(&C)");
         AppendMenuW(file_menu, MF_STRING, IDM_INSTALL_SENDTO, L"添加到「发送到」菜单(&S)");
         AppendMenuW(file_menu, MF_STRING, IDM_OPEN_SENDTO, L"打开「发送到」文件夹(&O)");
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FILES, L"添加文件…(&F)\tCtrl+O");
+        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FOLDER, L"添加文件夹…(&D)");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"退出(&X)");
 
@@ -295,6 +386,92 @@ namespace
                        : L"创建「发送到」快捷方式失败。");
     }
 
+    // 定义在文件后面（拖放 / 菜单 / 对话框都会用到）
+    void add_paths(const std::vector<std::wstring>& new_paths);
+
+    bool pick_files(std::vector<std::wstring>& chosen)
+    {
+        // 多选时缓冲区格式是 "目录\0文件1\0文件2\0\0"；单选时就是完整路径
+        std::vector<wchar_t> buffer(32 * 1024, L'\0');
+
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = g_window;
+        dialog.lpstrFilter = L"所有文件\0*.*\0\0";
+        dialog.lpstrFile = buffer.data();
+        dialog.nMaxFile = static_cast<DWORD>(buffer.size());
+        dialog.lpstrTitle = L"选择要检查的文件（可多选）";
+        dialog.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+        if (!GetOpenFileNameW(&dialog))
+        {
+            return false;
+        }
+
+        const std::wstring first(buffer.data());
+        const wchar_t* item = buffer.data() + first.size() + 1;
+        if (*item == L'\0')
+        {
+            chosen.push_back(first);
+            return true;
+        }
+
+        while (*item != L'\0')
+        {
+            const std::wstring name(item);
+            chosen.push_back(first + L"\\" + name);
+            item += name.size() + 1;
+        }
+        return true;
+    }
+
+    bool pick_folder(std::wstring& chosen)
+    {
+        // BIF_NEWDIALOGSTYLE 需要调用线程已初始化 COM
+        const HRESULT com_status = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+        BROWSEINFOW browse{};
+        browse.hwndOwner = g_window;
+        browse.lpszTitle = L"选择要检查的文件夹";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        bool ok = false;
+        if (LPITEMIDLIST item = SHBrowseForFolderW(&browse))
+        {
+            wchar_t path[MAX_PATH * 2]{};
+            if (SHGetPathFromIDListW(item, path))
+            {
+                chosen = path;
+                ok = true;
+            }
+            CoTaskMemFree(item);
+        }
+
+        if (SUCCEEDED(com_status))
+        {
+            CoUninitialize();
+        }
+        return ok;
+    }
+
+    void add_files_via_dialog()
+    {
+        std::vector<std::wstring> chosen;
+        if (pick_files(chosen))
+        {
+            add_paths(chosen);
+        }
+    }
+
+    void add_folder_via_dialog()
+    {
+        std::wstring chosen;
+        if (pick_folder(chosen))
+        {
+            add_paths({ chosen });
+        }
+    }
+
     void show_about()
     {
         const std::wstring text =
@@ -312,6 +489,8 @@ namespace
     {
         if (g_searching)
         {
+            // 正在查：排队，等这次结果回来立刻带着新路径再查一遍
+            g_search_pending = true;
             return;
         }
         if (g_paths.empty())
@@ -322,6 +501,7 @@ namespace
 
         g_searching = true;
         set_busy(true);
+        g_worker_running.store(true);
 
         auto paths = g_paths;
         std::thread([paths] {
@@ -340,10 +520,12 @@ namespace
             }
 
             HWND target = g_post_target.load();
-            if (target == nullptr || PostMessageW(target, WM_FL_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload)) == 0)
+            const bool posted = target != nullptr && PostMessageW(target, WM_FL_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload)) != 0;
+            if (!posted)
             {
                 delete payload;
             }
+            g_worker_running.store(false);
         }).detach();
     }
 
@@ -518,14 +700,15 @@ namespace
         return context.found;
     }
 
-    void send_paths_to_instance(HWND target, const std::vector<std::wstring>& paths)
+    // 返回 false 表示没送出去（例如对方是管理员权限：UIPI 会拦掉 WM_COPYDATA）。
+    bool send_paths_to_instance(HWND target, const std::vector<std::wstring>& paths)
     {
         auto payload = join(paths, L"\n");
         COPYDATASTRUCT data{};
         data.dwData = FL_COPYDATA_MAGIC;
         data.cbData = static_cast<DWORD>((payload.size() + 1) * sizeof(wchar_t));
         data.lpData = const_cast<wchar_t*>(payload.c_str());
-        SendMessageW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data));
+        return SendMessageW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data)) != 0;
     }
 
     LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
@@ -535,14 +718,7 @@ namespace
         case WM_CREATE:
             g_window = hwnd;
             g_post_target.store(hwnd);
-            {
-                NONCLIENTMETRICSW metrics{};
-                metrics.cbSize = sizeof(metrics);
-                if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
-                {
-                    g_font = CreateFontIndirectW(&metrics.lfMessageFont);
-                }
-            }
+            g_font = create_ui_font(window_dpi(hwnd));
 
             g_path_label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                            0, 0, 0, 0, hwnd, control_id(IDC_PATH_LABEL), g_instance, nullptr);
@@ -573,19 +749,20 @@ namespace
             g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
                                        0, 0, 0, 0, hwnd, control_id(IDC_STATUS), g_instance, nullptr);
 
-            if (g_font)
-            {
-                SendMessageW(g_path_label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-                SendMessageW(g_list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-                SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-                for (int i = 0; i < BUTTON_COUNT; ++i)
-                {
-                    SendMessageW(g_buttons[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-                }
-            }
+            apply_ui_font();
 
             build_menu(hwnd);
             DragAcceptFiles(hwnd, TRUE);
+            for (HWND child : { g_list, g_path_label, g_status })
+            {
+                SetWindowSubclass(child, drop_subclass_proc, DROP_SUBCLASS_ID, 0);
+                DragAcceptFiles(child, TRUE);
+            }
+            for (int i = 0; i < BUTTON_COUNT; ++i)
+            {
+                SetWindowSubclass(g_buttons[i], drop_subclass_proc, DROP_SUBCLASS_ID, 0);
+                DragAcceptFiles(g_buttons[i], TRUE);
+            }
             update_path_label();
             layout(hwnd);
             return 0;
@@ -593,6 +770,29 @@ namespace
         case WM_SIZE:
             layout(hwnd);
             return 0;
+
+        case kDpiChangedMessage:
+        {
+            // 拖到另一块不同缩放比的显示器：按新 DPI 重建字体，并按系统建议调整窗口大小
+            const UINT new_dpi = HIWORD(w_param);
+            if (g_font != nullptr)
+            {
+                DeleteObject(g_font);
+                g_font = nullptr;
+            }
+            g_font = create_ui_font(new_dpi);
+            apply_ui_font();
+
+            const RECT* suggested = reinterpret_cast<const RECT*>(l_param);
+            if (suggested != nullptr)
+            {
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left, suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            layout(hwnd);
+            return 0;
+        }
 
         case WM_COMMAND:
             switch (LOWORD(w_param))
@@ -612,6 +812,8 @@ namespace
                     set_status(L"打不开「发送到」文件夹。");
                 }
                 return 0;
+            case IDM_ADD_FILES: add_files_via_dialog(); return 0;
+            case IDM_ADD_FOLDER: add_folder_via_dialog(); return 0;
             case IDM_REFRESH: start_search(); return 0;
             case IDM_ELEVATE: restart_elevated(); return 0;
             case IDM_ABOUT: show_about(); return 0;
@@ -746,6 +948,12 @@ namespace
                     set_status(text);
                 }
             }
+
+            if (g_search_pending)
+            {
+                g_search_pending = false;
+                start_search();
+            }
             return 0;
         }
 
@@ -786,8 +994,12 @@ namespace gui
         {
             if (HWND other = find_other_instance())
             {
-                send_paths_to_instance(other, paths);
-                return 0;
+                if (send_paths_to_instance(other, paths))
+                {
+                    return 0;
+                }
+                // 送不出去（对方提权 / UIPI 拦截）就自己开一个窗口，
+                // 不能静默退出 —— 否则用户看到的就是"拖进来完全没反应"。
             }
         }
 
@@ -826,15 +1038,23 @@ namespace gui
         else
         {
             SetFocus(g_list);
-            set_status(shell_integration::is_context_menu_installed()
-                           ? L"把文件拖进来，或在资源管理器里右键 → 什么正在占用这个文件？"
-                           : L"提示: 还没添加右键菜单 —— 点上面的「文件」菜单 → 添加到资源管理器右键菜单。");
+            if (app::is_process_elevated())
+            {
+                set_status(L"管理员模式：拖放被 Windows 禁止（UIPI）。请用「文件 → 添加文件… / 添加文件夹…」，或把文件拖到 exe 图标上。");
+            }
+            else
+            {
+                set_status(shell_integration::is_context_menu_installed()
+                               ? L"把文件拖进来，或在资源管理器里右键 → 什么正在占用这个文件？"
+                               : L"提示: 还没添加右键菜单 —— 点上面的「文件」菜单 → 添加到资源管理器右键菜单。");
+            }
         }
 
         // F5 必须走加速键表：键盘消息是发给焦点控件的（这里是 ListView），
         // 光在主窗口的 WM_KEYDOWN 里判断收不到。
         ACCEL accelerators[] = {
             { FVIRTKEY, VK_F5, IDM_REFRESH },
+            { FVIRTKEY | FCONTROL, 'O', IDM_ADD_FILES },
         };
         HACCEL accelerator_table = CreateAcceleratorTableW(accelerators, ARRAYSIZE(accelerators));
 
@@ -854,11 +1074,10 @@ namespace gui
             DestroyAcceleratorTable(accelerator_table);
         }
 
-        // Give the (detached) enumeration thread a moment to notice that the
-        // window is gone before the process tears down.
-        if (g_searching)
+        // 等后台枚举线程收尾（最多 2 秒），别在线程还卡在系统调用里的时候拆 CRT
+        for (int i = 0; i < 40 && g_worker_running.load(); ++i)
         {
-            Sleep(300);
+            Sleep(50);
         }
         return 0;
     }

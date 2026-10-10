@@ -18,6 +18,9 @@ namespace app
     // Writes a wide string either to the console (proper Unicode) or as UTF-8
     // bytes when stdout is redirected to a file/pipe.
     void out(const std::wstring& text);
+    // 同上，但写 stderr。诊断信息（警告 / 进度）走这里，好让 --json 的 stdout
+    // 保持"只有一行 JSON"，脚本可以直接解析。
+    void err(const std::wstring& text);
 
     // ---- process helpers --------------------------------------------------
     bool is_process_elevated();

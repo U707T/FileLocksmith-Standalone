@@ -307,10 +307,14 @@ int cli_main(const std::vector<std::wstring>& args)
             app::out(L"当前已经是管理员权限。\n");
             return 0;
         }
+        // 提权后要执行的是同一件事：只摘掉 --elevate，其余开关全部保留
         std::vector<std::wstring> new_args;
-        for (const auto& path : paths)
+        for (const auto& arg : args)
         {
-            new_args.push_back(path);
+            if (arg != L"--elevate")
+            {
+                new_args.push_back(arg);
+            }
         }
         if (new_args.empty())
         {
@@ -337,7 +341,7 @@ int cli_main(const std::vector<std::wstring>& args)
         }
 
         out += L"正在等待文件被解锁...\n";
-        app::out(out);
+        app::err(out);
 
         auto start_time = std::chrono::steady_clock::now();
         bool first_pass = true;
@@ -346,7 +350,8 @@ int cli_main(const std::vector<std::wstring>& args)
             LocksmithResult locks;
             try
             {
-                locks = find_locks(paths);
+                // 轮询时跳过模块扫描（那是最慢的一步），判定解锁前再完整查一次
+                locks = find_locks(paths, /* include_modules */ false);
             }
             catch (const std::exception& ex)
             {
@@ -367,8 +372,20 @@ int cli_main(const std::vector<std::wstring>& args)
 
             if (locks.processes.empty())
             {
-                app::out(L"文件已解锁。\n");
-                return 0;
+                bool still_locked = false;
+                try
+                {
+                    still_locked = !find_locks(paths, /* include_modules */ true).processes.empty();
+                }
+                catch (const std::exception&)
+                {
+                }
+
+                if (!still_locked)
+                {
+                    app::out(L"文件已解锁。\n");
+                    return 0;
+                }
             }
 
             if (timeout_ms >= 0)
@@ -397,21 +414,34 @@ int cli_main(const std::vector<std::wstring>& args)
     }
 
     std::vector<ProcessResult> results = locks.processes;
-    std::wstring output;
+
+    // 诊断信息（警告 / 进度 / 结果说明）走 stderr：
+    // --json 模式下 stdout 必须只有一行 JSON，脚本才能直接解析。
+    auto note = [json_output](const std::wstring& text) {
+        if (json_output)
+        {
+            app::err(text);
+        }
+        else
+        {
+            app::out(text);
+        }
+    };
 
     if (!locks.unresolved_paths.empty())
     {
-        output += L"警告: 下面 " + std::to_wstring(locks.unresolved_paths.size()) +
-                  L" 个路径打不开（不存在 / 没权限 / 不是本地对象），没有被检查:\n";
+        std::wstring warning = L"警告: 下面 " + std::to_wstring(locks.unresolved_paths.size()) +
+                               L" 个路径打不开（不存在 / 没权限 / 不是本地对象），没有被检查:\n";
         for (const auto& path : locks.unresolved_paths)
         {
-            output += L"  ? " + path + L"\n";
+            warning += L"  ? " + path + L"\n";
         }
+        note(warning);
     }
 
     if (!locks.handles_query_ok)
     {
-        output += L"警告: 句柄枚举失败，“没有占用”这个结论不可信（可试试 --elevate）。\n";
+        note(L"警告: 句柄枚举失败，“没有占用”这个结论不可信（可试试 --elevate）。\n");
     }
 
     // 1) 先尝试强制解除占用（关句柄，不结束进程）
@@ -419,17 +449,17 @@ int cli_main(const std::vector<std::wstring>& args)
     {
         if (locks.handles.empty())
         {
-            output += L"没有找到可强制关闭的文件句柄。\n";
+            note(L"没有找到可强制关闭的文件句柄。\n");
         }
         else
         {
             std::vector<std::wstring> failures;
             const auto closed = release_handles(locks.handles, failures);
-            output += L"已强制关闭 " + std::to_wstring(closed) + L"/" + std::to_wstring(locks.handles.size()) +
-                      L" 个文件句柄（进程没有被结束，但持有它的程序可能出现异常，请自行确认）。\n";
+            note(L"已强制关闭 " + std::to_wstring(closed) + L"/" + std::to_wstring(locks.handles.size()) +
+                 L" 个文件句柄（进程没有被结束，但持有它的程序可能出现异常，请自行确认）。\n");
             for (const auto& failure : failures)
             {
-                output += L"  ! " + failure + L"\n";
+                note(L"  ! " + failure + L"\n");
             }
         }
 
@@ -443,14 +473,14 @@ int cli_main(const std::vector<std::wstring>& args)
             results.clear();
         }
 
-        output += results.empty() ? L"文件已经解锁。\n"
-                                  : L"仍然被 " + std::to_wstring(results.size()) + L" 个进程占用（可用 --kill 结束它们，或用 --elevate 提权后重试）。\n";
+        note(results.empty() ? L"文件已经解锁。\n"
+                             : L"仍然被 " + std::to_wstring(results.size()) + L" 个进程占用（可用 --kill 结束它们，或用 --elevate 提权后重试）。\n");
     }
 
     // 2) 仍然占用时，按需结束进程
     if (kill)
     {
-        output += kill_processes(results);
+        note(kill_processes(results));
         try
         {
             results = find_processes_recursive(paths);
@@ -463,17 +493,16 @@ int cli_main(const std::vector<std::wstring>& args)
 
     if (json_output)
     {
-        output += to_json(results, locks.unresolved_paths) + L"\n";
+        app::out(to_json(results, locks.unresolved_paths) + L"\n");
     }
     else
     {
-        output += to_text(results, locks.unresolved_paths.size() < paths.size());
+        std::wstring text = to_text(results, locks.unresolved_paths.size() < paths.size());
         if (!results.empty() && !app::is_process_elevated())
         {
-            output += L"\n提示: 部分系统级进程需要管理员权限才能看到或结束，可使用 --elevate。\n";
+            text += L"\n提示: 部分系统级进程需要管理员权限才能看到或结束，可使用 --elevate。\n";
         }
+        app::out(text);
     }
-
-    app::out(output);
     return 0;
 }
