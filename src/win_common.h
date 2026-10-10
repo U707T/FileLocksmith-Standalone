@@ -60,6 +60,12 @@
 #ifndef STATUS_BUFFER_OVERFLOW
 #define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
 #endif
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW 1
+#endif
+#ifndef MSGFLT_RESET
+#define MSGFLT_RESET 0
+#endif
 
 // ---------------------------------------------------------------------------
 // GetProcAddress 返回 FARPROC：直接 reinterpret_cast 到目标函数指针会让 GCC 报

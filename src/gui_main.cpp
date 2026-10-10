@@ -86,15 +86,19 @@ namespace gui::detail
             apply_ui_font();
 
             build_menu(hwnd);
+            // 提权模式下这些窗口也要能收到资源管理器的拖放（见 allow_unelevated_drop 的说明）
+            allow_unelevated_drop(hwnd);
             DragAcceptFiles(hwnd, TRUE);
             for (HWND child : { ui().list, ui().path_label, ui().status })
             {
                 SetWindowSubclass(child, drop_subclass_proc, DROP_SUBCLASS_ID, 0);
+                allow_unelevated_drop(child);
                 DragAcceptFiles(child, TRUE);
             }
             for (int i = 0; i < BUTTON_COUNT; ++i)
             {
                 SetWindowSubclass(ui().buttons[i], drop_subclass_proc, DROP_SUBCLASS_ID, 0);
+                allow_unelevated_drop(ui().buttons[i]);
                 DragAcceptFiles(ui().buttons[i], TRUE);
             }
             update_path_label();
@@ -457,6 +461,8 @@ namespace gui
         // Multi-select from the shell starts one process per file: hand the paths
         // over to the instance that is already running instead of opening a pile
         // of windows.
+        // （提权窗口现在也放行了 WM_COPYDATA，所以"拖到 exe 图标"在管理员模式下同样能转发成功；
+        //   只有送不进去时才退化成自己开一个窗口——绝不允许静默退出。）
         if (!paths.empty())
         {
             if (HWND other = detail::find_other_instance())
@@ -513,7 +519,7 @@ namespace gui
             SetFocus(ui().list);
             if (app::is_process_elevated())
             {
-                detail::set_status(L"管理员模式：拖放被 Windows 禁止（UIPI）。请用「文件 → 添加文件… / 添加文件夹…」，或把文件拖到 exe 图标上。");
+                detail::set_status(L"管理员模式：若拖放没有反应（UIPI 限制），请用「文件 → 添加文件… / 添加文件夹…」，或把文件拖到 exe 图标上。");
             }
             else
             {

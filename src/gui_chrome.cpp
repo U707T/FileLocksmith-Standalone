@@ -29,7 +29,7 @@ namespace gui::detail
             text = L"把文件或文件夹拖到窗口里（也可以拖到 exe 图标上）";
             if (app::is_process_elevated())
             {
-                text += L"\n当前是管理员模式：Windows 不允许从资源管理器拖放到提权窗口，请用「文件 → 添加文件…」";
+                text += L"\n当前是管理员模式：若拖放无反应（UIPI），请用「文件 → 添加文件… / 添加文件夹…」";
             }
         }
         else if (ui().paths.size() <= 2)
@@ -130,6 +130,34 @@ namespace gui::detail
         MoveWindow(ui().status, margin, y + button_height + 2, client.right - 2 * margin, status_height, TRUE);
 
         resize_columns(client.right - 2 * margin);
+    }
+
+    // 提权窗口默认收不到低完整性进程（资源管理器）的拖放：UIPI 既拦消息、也拦共享内存访问。
+    // 把这三个消息显式放行后，传统 WM_DROPFILES 路径才能在提权窗口里工作：
+    //   WM_DROPFILES            —— 拖放动作本身
+    //   WM_COPYDATA             —— 第二个实例转发路径（拖到 exe 图标 / 打开方式）
+    //   0x0049 (COPYGLOBALDATA) —— 文件列表本体在共享内存里，DragQueryFileW 读它走这条消息；
+    //                              漏放它会出现"能拖进来、但文件名是空的"
+    // 走 OLE drag-drop（RegisterDragDrop）的程序在这里救不回来——UIPI 拦在 OLE 层；
+    // 本程序用的是传统 DragAcceptFiles，拦在消息层，所以可以放行。
+    //
+    // 放行的只是消息通道：破坏性操作（结束进程 / 强制解锁 / 删除）仍然逐次弹窗确认，
+    // 低完整性进程塞进来的只是路径列表，不会产生任何静默动作。
+    void allow_unelevated_drop(HWND wnd)
+    {
+        constexpr UINT WmCopyGlobalData = 0x0049;
+        using ChangeWindowMessageFilterEx_t = BOOL(WINAPI*)(HWND, UINT, DWORD, void*);
+        static auto change_filter = load_proc<ChangeWindowMessageFilterEx_t>(
+            GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx");
+        if (change_filter == nullptr)
+        {
+            return;   // 没有这个 API 就维持原状：拖不进来而已，不影响其它功能
+        }
+        const UINT messages[] = { WM_DROPFILES, WM_COPYDATA, WmCopyGlobalData };
+        for (UINT message : messages)
+        {
+            change_filter(wnd, message, MSGFLT_ALLOW, nullptr);
+        }
     }
 
     LRESULT CALLBACK drop_subclass_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data)

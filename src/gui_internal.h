@@ -147,6 +147,7 @@ namespace gui::detail
     void delete_checked_paths();
     std::wstring describe_paths_for_dialog();
     LRESULT CALLBACK drop_subclass_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data);
+    void allow_unelevated_drop(HWND wnd);
     void fill_list();
     HWND find_other_instance();
     void finish_delete();
