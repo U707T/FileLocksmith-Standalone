@@ -413,7 +413,7 @@ std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes_ex(bool* ok
     }
 
     std::vector<ProcessInfo> result;
-    auto info_ptr = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(get_info_result.memory.data());
+    auto info_ptr = reinterpret_cast<FL_SYSTEM_PROCESS_INFORMATION*>(get_info_result.memory.data());
 
     while (info_ptr->NextEntryOffset)
     {
