@@ -82,16 +82,25 @@ namespace gui::detail
         {
             return;
         }
-        // 用户手动调过列宽（或上次退出时记下来的）就别再自作聪明
+        // 用户手动调过列宽（或上次退出时记下来的）：恢复前几列，最后一列（文件）吸收剩余宽度。
+        // 否则旧的列宽总和可能超过现在的窗口宽度 —— 列表下面就会一直挂着一条横向滚动条。
         if (ui().saved_state.column_count >= COLUMN_COUNT && !ui().columns_restored)
         {
-            for (int i = 0; i < COLUMN_COUNT; ++i)
+            int used = 0;
+            for (int i = 0; i < COLUMN_COUNT - 1; ++i)
             {
                 if (ui().saved_state.columns[i] > 0)
                 {
                     ListView_SetColumnWidth(ui().list, i, ui().saved_state.columns[i]);
+                    used += ui().saved_state.columns[i];
                 }
             }
+            int files_width = list_width - used - scale(30);
+            if (files_width < scale(120))
+            {
+                files_width = scale(120);
+            }
+            ListView_SetColumnWidth(ui().list, COLUMN_COUNT - 1, files_width);
             ui().columns_restored = true;
             return;
         }
@@ -232,9 +241,9 @@ namespace gui::detail
             {
                 slot_gap = scale(8);
             }
-            if (slot_gap > scale(20))
+            if (slot_gap > scale(14))
             {
-                slot_gap = scale(20);
+                slot_gap = scale(14);
             }
         }
         int x = margin + (available - (row_total + slot_gap * (BUTTON_COUNT - 1))) / 2;
@@ -297,6 +306,13 @@ namespace gui::detail
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
+                // 表头也在列表客户区里：把它占的高度从可用区域扣掉，文字再居中也不会压到表头
+                if (HWND header = ListView_GetHeader(hwnd))
+                {
+                    RECT header_rect{};
+                    GetWindowRect(header, &header_rect);
+                    client.top += header_rect.bottom - header_rect.top;
+                }
                 HDC dc = GetDC(hwnd);
                 if (dc != nullptr)
                 {
@@ -306,8 +322,17 @@ namespace gui::detail
                     HGDIOBJ previous = SelectObject(dc, ui().font != nullptr ? ui().font : GetStockObject(DEFAULT_GUI_FONT));
                     SetBkMode(dc, TRANSPARENT);
                     SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                    // 注意：DT_VCENTER 只在搭配 DT_SINGLELINE 时生效。多行文字要先用 DT_CALCRECT
+                    // 量出高度、再手动垂直居中，否则会被画在顶部（还会压到表头上）。
                     RECT text_rect = client;
-                    DrawTextW(dc, text, -1, &text_rect, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+                    DrawTextW(dc, text, -1, &text_rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                    const int text_height = text_rect.bottom - text_rect.top;
+                    const int centered_top = client.top + ((client.bottom - client.top) - text_height) / 2;
+                    text_rect.left = client.left;
+                    text_rect.right = client.right;
+                    text_rect.top = centered_top;
+                    text_rect.bottom = centered_top + text_height;
+                    DrawTextW(dc, text, -1, &text_rect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
                     SelectObject(dc, previous);
                     ReleaseDC(hwnd, dc);
                 }
