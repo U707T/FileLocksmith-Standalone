@@ -322,16 +322,15 @@ namespace gui::detail
             // 不能让它盖掉新一轮的结果（否则界面会先显示旧文件的内容）
             if (payload->generation != ui().search_generation)
             {
+                // 这一轮 worker 已经结束：先把界面从"正在扫描"状态收回来，
+                // 否则 searching 一直为真，新扫描永远起不来（界面看起来就是"拖不进去"）
+                KillTimer(ui().window, BUSY_TIMER_ID);
+                set_busy(false);
+
                 if (ui().search_pending)
                 {
                     ui().search_pending = false;
                     start_search();
-                }
-                else if (!ui().searching)
-                {
-                    // 兜底：没有排队的新扫描就收尾，别让界面永远停在"正在扫描…"
-                    KillTimer(ui().window, BUSY_TIMER_ID);
-                    set_busy(false);
                 }
                 return 0;
             }

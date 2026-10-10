@@ -61,9 +61,12 @@ namespace gui::detail
 
     void start_search()
     {
-        if (ui().searching)
+        // 判断"是否还有扫描在跑"必须用 worker 自己维护的原子标志：
+        // 手动维护的 searching 只要漏一次复位，就会永远卡在"正在扫描…"
+        // （2.0.1 的拖放死锁就是：过期结果那条分支没有把 searching 复位，
+        //   于是 start_search 一直被判定为"正在查"，新扫描永远起不来）
+        if (ui().worker_running.load())
         {
-            // 正在查：排队，等这次结果回来立刻带着新路径再查一遍
             ui().search_pending = true;
             return;
         }
@@ -118,13 +121,15 @@ namespace gui::detail
                 payload->error = L"枚举失败: 未知错误";
             }
 
+            // 先复位再投递：主线程收到结果时就能立刻启动下一轮扫描
+            ui().worker_running.store(false);
+
             HWND target = ui().post_target.load();
             const bool posted = target != nullptr && PostMessageW(target, WM_FL_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload)) != 0;
             if (!posted)
             {
                 delete payload;
             }
-            ui().worker_running.store(false);
         }).detach();
     }
 
