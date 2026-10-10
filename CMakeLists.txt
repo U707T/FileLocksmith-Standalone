@@ -24,6 +24,7 @@ add_executable(FileLocksmith WIN32
     src/cli.cpp
     src/gui.cpp
     src/shell_integration.cpp
+    src/ui_state.cpp
     src/file_locksmith.cpp
     src/ntdll_base.cpp
     src/ntdll_extensions.cpp

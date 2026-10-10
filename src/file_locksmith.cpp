@@ -117,7 +117,8 @@ LocksmithResult find_locks(const std::vector<std::wstring>& paths, bool include_
                 process_info.name,
                 process_info.pid,
                 process_info.user,
-                std::vector(it->second.begin(), it->second.end()) });
+                std::vector(it->second.begin(), it->second.end()),
+                process_info.image_path });
         }
     }
 
@@ -268,7 +269,7 @@ std::vector<ProcessResult> find_application_processes(const std::wstring& execut
     {
         if (pids.count(process.pid) != 0)
         {
-            result.push_back(ProcessResult{ process.name, process.pid, process.user, { process.image_path } });
+            result.push_back(ProcessResult{ process.name, process.pid, process.user, { process.image_path }, process.image_path });
         }
     }
 

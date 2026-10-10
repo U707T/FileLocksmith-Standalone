@@ -4,6 +4,7 @@
 #include "app_utils.h"
 #include "file_locksmith.h"
 #include "shell_integration.h"
+#include "ui_state.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -37,6 +38,12 @@ namespace
     constexpr int IDM_EXIT = 2008;
     constexpr int IDM_ADD_FILES = 2009;
     constexpr int IDM_ADD_FOLDER = 2010;
+    constexpr int IDM_LIST_KILL = 2100;
+    constexpr int IDM_LIST_LOCATE = 2101;
+    constexpr int IDM_LIST_COPY_EXE = 2102;
+    constexpr int IDM_LIST_COPY_PID = 2103;
+    constexpr int IDM_LIST_COPY_ROW = 2104;
+    constexpr int IDM_LIST_SELECT_ALL = 2105;
     constexpr int IDM_DELETE_FILES = 2011;
 
     // 子控件转发拖放用的 subclass id
@@ -66,6 +73,16 @@ namespace
     constexpr UINT WM_FL_SEARCH_DONE = WM_APP + 1;
     constexpr ULONG FL_COPYDATA_MAGIC = 0x464C534D; // 'FLSM'
 
+    // 列：进程 / PID / 用户 / 占用方式 / 文件
+    constexpr int COL_PROCESS = 0;
+    constexpr int COL_PID = 1;
+    constexpr int COL_USER = 2;
+    constexpr int COL_KIND = 3;
+    constexpr int COL_FILES = 4;
+    constexpr int COLUMN_COUNT = 5;
+
+    constexpr UINT_PTR BUSY_TIMER_ID = 1;
+
     HINSTANCE g_instance = nullptr;
     HWND g_window = nullptr;
     HWND g_list = nullptr;
@@ -74,6 +91,17 @@ namespace
     HWND g_buttons[BUTTON_COUNT] = {};
     HFONT g_font = nullptr;
     HMENU g_main_menu = nullptr;
+    HIMAGELIST g_icons = nullptr;
+    std::map<std::wstring, int> g_icon_cache;
+    ui_state::WindowState g_saved_state;
+    bool g_columns_restored = false;
+    DWORD g_busy_started = 0;
+
+    // 前向声明（这几个 helper 定义在文件后半段）
+    void update_button_states();
+    int icon_index_for(const std::wstring& path);
+    std::vector<int> selected_rows();
+    void update_path_label();
 
     bool g_searching = false;
     // 搜索进行中又来了新路径（拖放经常接着上一轮）时，等这轮结束再查一次
@@ -144,22 +172,39 @@ namespace
                    L"、" + g_paths[1] + L" …";
         }
         SetWindowTextW(g_path_label, text.c_str());
+
+        std::wstring title = L"FileLocksmith";
+        title += g_paths.empty() ? L" — 什么正在占用这个文件？"
+                                 : L" — " + std::to_wstring(g_paths.size()) + L" 个路径";
+        if (app::is_process_elevated())
+        {
+            title += L"（管理员）";
+        }
+        if (g_window != nullptr)
+        {
+            SetWindowTextW(g_window, title.c_str());
+        }
     }
 
     void set_busy(bool busy)
     {
-        for (int i = 0; i < BUTTON_COUNT; ++i)
-        {
-            EnableWindow(g_buttons[i], !busy);
-        }
+        g_searching = busy;
         if (busy)
         {
-            set_status(L"正在枚举系统句柄，请稍候…（文件较多时可能需要几秒）");
+            set_status(L"正在扫描系统句柄…");
         }
+        update_button_states();
     }
 
     void fill_list()
     {
+        // 每个进程占了多少个句柄：0 个说明只是模块映射（文件被当成 DLL/EXE 加载）
+        std::map<DWORD, int> handle_counts;
+        for (const auto& handle : g_handles)
+        {
+            ++handle_counts[handle.pid];
+        }
+
         SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
         ListView_DeleteAllItems(g_list);
 
@@ -169,25 +214,33 @@ namespace
             auto pid_text = std::to_wstring(result.pid);
             auto files_text = join(result.files, L"; ");
 
+            const int handle_count = handle_counts.count(result.pid) != 0 ? handle_counts[result.pid] : 0;
+            const std::wstring kind_text = handle_count > 0
+                                               ? L"句柄 ×" + std::to_wstring(handle_count)
+                                               : L"模块映射";
+
             LVITEMW item{};
-            item.mask = LVIF_TEXT | LVIF_PARAM;
+            item.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
             item.iItem = index;
             item.lParam = index;
-            item.pszText = pid_text.data();
+            item.iImage = icon_index_for(result.image_path);
+            item.pszText = const_cast<wchar_t*>(result.name.c_str());
             int row = ListView_InsertItem(g_list, &item);
             if (row < 0)
             {
                 break;
             }
 
-            ListView_SetItemText(g_list, row, 1, const_cast<wchar_t*>(result.name.c_str()));
-            ListView_SetItemText(g_list, row, 2, const_cast<wchar_t*>(result.user.c_str()));
-            ListView_SetItemText(g_list, row, 3, const_cast<wchar_t*>(files_text.c_str()));
+            ListView_SetItemText(g_list, row, COL_PID, pid_text.data());
+            ListView_SetItemText(g_list, row, COL_USER, const_cast<wchar_t*>(result.user.c_str()));
+            ListView_SetItemText(g_list, row, COL_KIND, const_cast<wchar_t*>(kind_text.c_str()));
+            ListView_SetItemText(g_list, row, COL_FILES, const_cast<wchar_t*>(files_text.c_str()));
             ++index;
         }
 
         SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(g_list, nullptr, TRUE);
+        update_button_states();
     }
 
     void resize_columns(int list_width)
@@ -196,18 +249,38 @@ namespace
         {
             return;
         }
-        const int pid_width = 80;
+        // 用户手动调过列宽（或上次退出时记下来的）就别再自作聪明
+        if (g_saved_state.column_count >= COLUMN_COUNT && !g_columns_restored)
+        {
+            for (int i = 0; i < COLUMN_COUNT; ++i)
+            {
+                if (g_saved_state.columns[i] > 0)
+                {
+                    ListView_SetColumnWidth(g_list, i, g_saved_state.columns[i]);
+                }
+            }
+            g_columns_restored = true;
+            return;
+        }
+        if (g_columns_restored)
+        {
+            return;
+        }
+
         const int name_width = 190;
-        const int user_width = 150;
-        int files_width = list_width - pid_width - name_width - user_width - 30;
+        const int pid_width = 80;
+        const int user_width = 140;
+        const int kind_width = 90;
+        int files_width = list_width - name_width - pid_width - user_width - kind_width - 30;
         if (files_width < 120)
         {
             files_width = 120;
         }
-        ListView_SetColumnWidth(g_list, 0, pid_width);
-        ListView_SetColumnWidth(g_list, 1, name_width);
-        ListView_SetColumnWidth(g_list, 2, user_width);
-        ListView_SetColumnWidth(g_list, 3, files_width);
+        ListView_SetColumnWidth(g_list, COL_PROCESS, name_width);
+        ListView_SetColumnWidth(g_list, COL_PID, pid_width);
+        ListView_SetColumnWidth(g_list, COL_USER, user_width);
+        ListView_SetColumnWidth(g_list, COL_KIND, kind_width);
+        ListView_SetColumnWidth(g_list, COL_FILES, files_width);
     }
 
     void layout(HWND hwnd)
@@ -310,6 +383,107 @@ namespace
         {
             SendMessageW(g_buttons[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         }
+    }
+
+    void init_icons()
+    {
+        const int size = GetSystemMetrics(SM_CXSMICON);
+        g_icons = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 8, 8);
+        if (g_icons != nullptr)
+        {
+            ListView_SetImageList(g_list, g_icons, LVSIL_SMALL);
+        }
+    }
+
+    // 进程的 exe 图标（同类工具都有，列表一眼能分辨）；取不到就返回 -1，不影响其它功能
+    int icon_index_for(const std::wstring& path)
+    {
+        if (g_icons == nullptr || path.empty())
+        {
+            return -1;
+        }
+
+        if (auto it = g_icon_cache.find(path); it != g_icon_cache.end())
+        {
+            return it->second;
+        }
+
+        int index = -1;
+        HICON large_icon = nullptr;
+        HICON small_icon = nullptr;
+        if (ExtractIconExW(path.c_str(), 0, &large_icon, &small_icon, 1) > 0)
+        {
+            if (small_icon != nullptr)
+            {
+                index = ImageList_AddIcon(g_icons, small_icon);
+                DestroyIcon(small_icon);
+            }
+            if (large_icon != nullptr)
+            {
+                DestroyIcon(large_icon);
+            }
+        }
+
+        g_icon_cache[path] = index;
+        return index;
+    }
+
+    void copy_to_clipboard(const std::wstring& text)
+    {
+        if (text.empty() || !OpenClipboard(g_window))
+        {
+            return;
+        }
+
+        EmptyClipboard();
+        const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes))
+        {
+            if (void* target = GlobalLock(memory))
+            {
+                memcpy(target, text.c_str(), bytes);
+                GlobalUnlock(memory);
+                SetClipboardData(CF_UNICODETEXT, memory);   // 成功后所有权归系统
+            }
+            else
+            {
+                GlobalFree(memory);
+            }
+        }
+        CloseClipboard();
+    }
+
+    std::vector<int> selected_rows()
+    {
+        std::vector<int> rows;
+        int row = -1;
+        while ((row = ListView_GetNextItem(g_list, row, LVNI_SELECTED)) != -1)
+        {
+            rows.push_back(row);
+        }
+        return rows;
+    }
+
+    const ProcessResult* result_at(int row)
+    {
+        if (row < 0 || row >= static_cast<int>(g_results.size()))
+        {
+            return nullptr;
+        }
+        return &g_results[row];
+    }
+
+    // 没有选中项时那几个按钮应该是灰的（同类工具都这样，别让用户点了才知道）
+    void update_button_states()
+    {
+        const bool has_selection = !selected_rows().empty();
+        EnableWindow(g_buttons[0], !g_searching && has_selection);       // 结束进程
+        EnableWindow(g_buttons[1], !g_searching && !g_results.empty());  // 全部结束
+        EnableWindow(g_buttons[2], !g_searching && !g_results.empty());  // 强制解锁
+        EnableWindow(g_buttons[3], !g_searching && !g_paths.empty());    // 删除文件
+        EnableWindow(g_buttons[4], !g_searching);                        // 重新检查
+        EnableWindow(g_buttons[5], !g_searching && has_selection);       // 打开所在位置
+        EnableWindow(g_buttons[6], !g_searching);                        // 以管理员身份重启
     }
 
     void update_menu_state()
@@ -508,6 +682,8 @@ namespace
 
         g_searching = true;
         set_busy(true);
+        g_busy_started = GetTickCount();
+        SetTimer(g_window, BUSY_TIMER_ID, 500, nullptr);
         g_worker_running.store(true);
 
         auto paths = g_paths;
@@ -558,30 +734,53 @@ namespace
 
     void kill_selected()
     {
-        int row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
-        if (row < 0 || row >= static_cast<int>(g_results.size()))
+        const auto rows = selected_rows();
+        if (rows.empty())
         {
-            set_status(L"请先在列表里选中一个进程。");
+            set_status(L"请先在列表里选中进程（按住 Ctrl / Shift 可以多选）。");
             return;
         }
 
-        auto& process = g_results[row];
-        std::wstring question = L"确定要结束 " + process.name + L" (PID " + std::to_wstring(process.pid) + L") 吗？\n\n"
-                                L"进程里的未保存数据会丢失。";
+        std::wstring list;
+        for (size_t i = 0; i < rows.size() && i < 8; ++i)
+        {
+            const auto* process = result_at(rows[i]);
+            if (process != nullptr)
+            {
+                list += L"  " + process->name + L" (PID " + std::to_wstring(process->pid) + L")\n";
+            }
+        }
+        if (rows.size() > 8)
+        {
+            list += L"  …还有 " + std::to_wstring(rows.size() - 8) + L" 个\n";
+        }
+
+        const std::wstring question = L"确定要结束下面 " + std::to_wstring(rows.size()) + L" 个进程吗？\n\n" + list +
+                                      L"\n进程里的未保存数据会丢失。";
         if (MessageBoxW(g_window, question.c_str(), L"结束进程", MB_YESNO | MB_ICONWARNING) != IDYES)
         {
             return;
         }
 
-        if (app::terminate_process(process.pid))
+        int failed = 0;
+        for (int row : rows)
         {
-            set_status(L"已结束进程 " + std::to_wstring(process.pid) + L"，正在重新检查…");
-            start_search();
+            const auto* process = result_at(row);
+            if (process == nullptr || !app::terminate_process(process->pid))
+            {
+                ++failed;
+            }
+        }
+
+        if (failed == 0)
+        {
+            set_status(L"已结束 " + std::to_wstring(rows.size()) + L" 个进程，正在重新检查…");
         }
         else
         {
-            set_status(L"无法结束该进程，权限不足。可点击“以管理员身份重启”。");
+            set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可点「以管理员身份重启」。");
         }
+        start_search();
     }
 
     void kill_all()
@@ -815,14 +1014,100 @@ namespace
 
     void open_file_location()
     {
-        int row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
-        if (row < 0 || row >= static_cast<int>(g_results.size()) || g_results[row].files.empty())
+        // 多选时按顺序打开每一个（资源管理器会自己并成窗口）
+        const auto rows = selected_rows();
+        bool opened = false;
+        for (int row : rows)
+        {
+            const auto* process = result_at(row);
+            if (process == nullptr || process->files.empty())
+            {
+                continue;
+            }
+
+            std::wstring parameters = L"/select,\"" + process->files.front() + L"\"";
+            ShellExecuteW(g_window, L"open", L"explorer.exe", parameters.c_str(), nullptr, SW_SHOWNORMAL);
+            opened = true;
+        }
+
+        if (!opened)
+        {
+            set_status(L"选中的行里没有可定位的文件。");
+        }
+    }
+
+    // 列表里的右键菜单 / 复制 / 快捷键（同类工具都有）
+    void copy_selected(bool exe_path, bool pid_only, bool whole_row)
+    {
+        const auto rows = selected_rows();
+        std::wstring text;
+        for (int row : rows)
+        {
+            const auto* process = result_at(row);
+            if (process == nullptr)
+            {
+                continue;
+            }
+
+            if (!text.empty())
+            {
+                text += L"\r\n";
+            }
+
+            if (exe_path)
+            {
+                text += process->image_path.empty() ? process->name : process->image_path;
+            }
+            else if (pid_only)
+            {
+                text += std::to_wstring(process->pid);
+            }
+            else
+            {
+                text += process->name + L"\t" + std::to_wstring(process->pid) + L"\t" + process->user + L"\t" +
+                        join(process->files, L"; ");
+            }
+        }
+
+        if (text.empty())
+        {
+            set_status(L"没有可复制的内容（先选中几行）。");
+            return;
+        }
+
+        copy_to_clipboard(text);
+        set_status(L"已复制 " + std::to_wstring(rows.size()) + L" 行到剪贴板。");
+    }
+
+    void show_list_menu()
+    {
+        const bool has_selection = !selected_rows().empty();
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr)
         {
             return;
         }
 
-        std::wstring parameters = L"/select,\"" + g_results[row].files.front() + L"\"";
-        ShellExecuteW(g_window, L"open", L"explorer.exe", parameters.c_str(), nullptr, SW_SHOWNORMAL);
+        const UINT state = has_selection ? MF_ENABLED : MF_GRAYED;
+        AppendMenuW(menu, MF_STRING | state, IDM_LIST_KILL, L"结束选中的进程(&K)");
+        AppendMenuW(menu, MF_STRING | state, IDM_LIST_LOCATE, L"打开所在位置(&L)");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | state, IDM_LIST_COPY_EXE, L"复制进程路径(&P)");
+        AppendMenuW(menu, MF_STRING | state, IDM_LIST_COPY_PID, L"复制 PID(&I)");
+        AppendMenuW(menu, MF_STRING | state, IDM_LIST_COPY_ROW, L"复制整行(&R)");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_LIST_SELECT_ALL, L"全选(&A)");
+
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, g_window, nullptr);
+        DestroyMenu(menu);
+
+        if (command != 0)
+        {
+            SendMessageW(g_window, WM_COMMAND, static_cast<WPARAM>(command), 0);
+        }
     }
 
     void restart_elevated()
@@ -943,12 +1228,12 @@ namespace
                                            0, 0, 0, 0, hwnd, control_id(IDC_PATH_LABEL), g_instance, nullptr);
 
             g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                                     WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                     WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
                                      0, 0, 0, 0, hwnd, control_id(IDC_LIST), g_instance, nullptr);
             ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
             {
-                const wchar_t* titles[4] = { L"PID", L"进程", L"用户", L"占用的文件" };
-                for (int i = 0; i < 4; ++i)
+                const wchar_t* titles[COLUMN_COUNT] = { L"进程", L"PID", L"用户", L"占用方式", L"文件" };
+                for (int i = 0; i < COLUMN_COUNT; ++i)
                 {
                     LVCOLUMNW column{};
                     column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -957,6 +1242,7 @@ namespace
                     column.iSubItem = i;
                     ListView_InsertColumn(g_list, i, &column);
                 }
+                init_icons();
             }
 
             for (int i = 0; i < BUTTON_COUNT; ++i)
@@ -1023,6 +1309,16 @@ namespace
             case IDC_REFRESH: start_search(); return 0;
             case IDC_OPEN_LOCATION: open_file_location(); return 0;
             case IDC_ELEVATE: restart_elevated(); return 0;
+
+            case IDM_LIST_KILL: kill_selected(); return 0;
+            case IDM_LIST_LOCATE: open_file_location(); return 0;
+            case IDM_LIST_COPY_EXE: copy_selected(true, false, false); return 0;
+            case IDM_LIST_COPY_PID: copy_selected(false, true, false); return 0;
+            case IDM_LIST_COPY_ROW: copy_selected(false, false, true); return 0;
+            case IDM_LIST_SELECT_ALL:
+                ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED);
+                update_button_states();
+                return 0;
 
             case IDM_TOGGLE_CONTEXT_MENU: toggle_context_menu(); return 0;
             case IDM_INSTALL_SENDTO: add_sendto_menu(); return 0;
@@ -1115,20 +1411,68 @@ namespace
             }
             break;
 
+        case WM_TIMER:
+            if (w_param == BUSY_TIMER_ID && g_searching)
+            {
+                const auto elapsed = (GetTickCount() - g_busy_started) / 1000;
+                if (elapsed >= 1)
+                {
+                    set_status(L"正在扫描系统句柄…已 " + std::to_wstring(elapsed) + L" 秒"
+                               L"（进程多、模块多的时候会久一点）");
+                }
+                return 0;
+            }
+            break;
+
         case WM_NOTIFY:
         {
             auto header = reinterpret_cast<NMHDR*>(l_param);
-            if (header->hwndFrom == g_list && header->code == NM_DBLCLK)
+            if (header->hwndFrom != g_list)
+            {
+                break;
+            }
+
+            if (header->code == NM_DBLCLK)
             {
                 open_file_location();
                 return 0;
             }
+
+            if (header->code == NM_RCLICK)
+            {
+                // 右键先选中光标下那一行（Windows 的通用习惯），再弹菜单
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                POINT client = cursor;
+                ScreenToClient(g_list, &client);
+                LVHITTESTINFO hit{};
+                hit.pt = client;
+                const int row = ListView_HitTest(g_list, &hit);
+                if (row >= 0)
+                {
+                    if ((ListView_GetItemState(g_list, row, LVIS_SELECTED) & LVIS_SELECTED) == 0)
+                    {
+                        ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
+                        ListView_SetItemState(g_list, row, LVIS_SELECTED, LVIS_SELECTED);
+                    }
+                    update_button_states();
+                }
+                show_list_menu();
+                return 0;
+            }
+
+            if (header->code == LVN_ITEMCHANGED)
+            {
+                update_button_states();
+                return 0;
+            }
+
             break;
         }
 
         case WM_FL_SEARCH_DONE:
         {
-            g_searching = false;
+            KillTimer(g_window, BUSY_TIMER_ID);
             std::unique_ptr<SearchPayload> payload(reinterpret_cast<SearchPayload*>(l_param));
             set_busy(false);
 
@@ -1183,8 +1527,32 @@ namespace
         }
 
         case WM_CLOSE:
+        {
+            // 记住窗口位置/大小与列宽（同类工具都会记）
+            ui_state::WindowState state;
+            WINDOWPLACEMENT placement{};
+            placement.length = sizeof(placement);
+            if (GetWindowPlacement(hwnd, &placement))
+            {
+                state.maximized = placement.showCmd == SW_SHOWMAXIMIZED;
+                state.x = placement.rcNormalPosition.left;
+                state.y = placement.rcNormalPosition.top;
+                state.width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+                state.height = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+            }
+            if (g_list != nullptr)
+            {
+                state.column_count = COLUMN_COUNT;
+                for (int i = 0; i < COLUMN_COUNT; ++i)
+                {
+                    state.columns[i] = ListView_GetColumnWidth(g_list, i);
+                }
+            }
+            ui_state::save(state);
+
             DestroyWindow(hwnd);
             return 0;
+        }
 
         case WM_DESTROY:
             if (g_font)
@@ -1245,15 +1613,21 @@ namespace gui
         window_class.lpszClassName = WndClassName;
         RegisterClassExW(&window_class);
 
+        g_saved_state = ui_state::load();
+        const int window_x = g_saved_state.x != INT_MIN ? g_saved_state.x : CW_USEDEFAULT;
+        const int window_y = g_saved_state.y != INT_MIN ? g_saved_state.y : CW_USEDEFAULT;
+        const int window_width = g_saved_state.width > 480 ? g_saved_state.width : 980;
+        const int window_height = g_saved_state.height > 320 ? g_saved_state.height : 620;
+
         HWND window = CreateWindowExW(0, WndClassName, WindowTitle, WS_OVERLAPPEDWINDOW,
-                                      CW_USEDEFAULT, CW_USEDEFAULT, 940, 580,
+                                      window_x, window_y, window_width, window_height,
                                       nullptr, nullptr, g_instance, nullptr);
         if (window == nullptr)
         {
             return 1;
         }
 
-        ShowWindow(window, SW_SHOW);
+        ShowWindow(window, g_saved_state.maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(window);
 
         if (!g_paths.empty())
@@ -1279,7 +1653,10 @@ namespace gui
         // 光在主窗口的 WM_KEYDOWN 里判断收不到。
         ACCEL accelerators[] = {
             { FVIRTKEY, VK_F5, IDM_REFRESH },
+            { FVIRTKEY, VK_DELETE, IDM_LIST_KILL },
             { FVIRTKEY | FCONTROL, 'O', IDM_ADD_FILES },
+            { FVIRTKEY | FCONTROL, 'C', IDM_LIST_COPY_ROW },
+            { FVIRTKEY | FCONTROL, 'A', IDM_LIST_SELECT_ALL },
         };
         HACCEL accelerator_table = CreateAcceleratorTableW(accelerators, ARRAYSIZE(accelerators));
 
