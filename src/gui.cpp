@@ -19,6 +19,27 @@ namespace
     constexpr int IDC_OPEN_LOCATION = 1006;
     constexpr int IDC_PATH_LABEL = 1007;
     constexpr int IDC_STATUS = 1008;
+    constexpr int IDC_FORCE_UNLOCK = 1009;
+
+    // 按钮：ID / 文字 / 宽度。以前是按 “IDC_KILL_SELECTED + 序号” 分配 ID 的，
+    // 顺序和常量对不上，导致“打开所在位置”实际会触发“以管理员身份重启”，
+    // 这里改成显式声明。
+    struct ButtonSpec
+    {
+        int id;
+        const wchar_t* text;
+        int width;
+    };
+
+    const ButtonSpec g_buttons_spec[] = {
+        { IDC_KILL_SELECTED, L"结束进程", 110 },
+        { IDC_KILL_ALL, L"全部结束", 110 },
+        { IDC_FORCE_UNLOCK, L"强制解锁", 110 },
+        { IDC_REFRESH, L"重新检查", 90 },
+        { IDC_OPEN_LOCATION, L"打开所在位置", 140 },
+        { IDC_ELEVATE, L"以管理员身份重启", 170 },
+    };
+    constexpr int BUTTON_COUNT = static_cast<int>(sizeof(g_buttons_spec) / sizeof(g_buttons_spec[0]));
 
     constexpr UINT WM_FL_SEARCH_DONE = WM_APP + 1;
     constexpr ULONG FL_COPYDATA_MAGIC = 0x464C534D; // 'FLSM'
@@ -28,7 +49,7 @@ namespace
     HWND g_list = nullptr;
     HWND g_status = nullptr;
     HWND g_path_label = nullptr;
-    HWND g_buttons[5] = {};
+    HWND g_buttons[BUTTON_COUNT] = {};
     HFONT g_font = nullptr;
 
     bool g_searching = false;
@@ -36,10 +57,12 @@ namespace
     std::atomic<HWND> g_post_target{ nullptr };
     std::vector<std::wstring> g_paths;
     std::vector<ProcessResult> g_results;
+    std::vector<LockedHandle> g_handles;
+    bool g_handles_query_ok = true;
 
     struct SearchPayload
     {
-        std::vector<ProcessResult> results;
+        LocksmithResult locks;
         std::wstring error;
     };
 
@@ -85,11 +108,10 @@ namespace
 
     void set_busy(bool busy)
     {
-        EnableWindow(g_buttons[0], !busy);
-        EnableWindow(g_buttons[1], !busy);
-        EnableWindow(g_buttons[2], !busy);
-        EnableWindow(g_buttons[3], !busy);
-        EnableWindow(g_buttons[4], !busy);
+        for (int i = 0; i < BUTTON_COUNT; ++i)
+        {
+            EnableWindow(g_buttons[i], !busy);
+        }
         if (busy)
         {
             set_status(L"正在枚举系统句柄，请稍候…（文件较多时可能需要几秒）");
@@ -172,11 +194,10 @@ namespace
         y += remaining + gap;
 
         int x = margin;
-        const int widths[5] = { 110, 110, 90, 140, 170 };
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < BUTTON_COUNT; ++i)
         {
-            MoveWindow(g_buttons[i], x, y, widths[i], button_height, TRUE);
-            x += widths[i] + gap;
+            MoveWindow(g_buttons[i], x, y, g_buttons_spec[i].width, button_height, TRUE);
+            x += g_buttons_spec[i].width + gap;
         }
 
         MoveWindow(g_status, margin, y + button_height + 2, client.right - 2 * margin, status_height, TRUE);
@@ -204,7 +225,7 @@ namespace
             auto payload = new SearchPayload();
             try
             {
-                payload->results = find_processes_recursive(paths);
+                payload->locks = find_locks(paths);
             }
             catch (const std::exception& ex)
             {
@@ -282,6 +303,38 @@ namespace
         {
             set_status(L"有 " + std::to_wstring(failed) + L" 个进程无法结束（权限不足），可点击“以管理员身份重启”。");
         }
+        start_search();
+    }
+
+    void force_unlock()
+    {
+        if (g_handles.empty())
+        {
+            set_status(g_results.empty() ? L"没有可解锁的占用。"
+                                         : L"只找到模块映射（文件被当成 DLL/EXE 加载进去了），这种情况没法强制解除，只能结束进程。");
+            return;
+        }
+
+        std::wstring question = L"强制解除占用？\n\n"
+                                L"将关闭其他进程持有的 " + std::to_wstring(g_handles.size()) + L" 个文件句柄，不会结束任何进程。\n\n"
+                                L"⚠ 这相当于“不结束程序就直接拔掉 U 盘”：持有该句柄的程序之后可能报错、\n"
+                                L"   显示异常甚至崩溃，未保存的数据也可能丢失。\n\n"
+                                L"请先保存工作；能结束进程时优先用“结束进程”。\n\n确定继续吗？";
+        if (MessageBoxW(g_window, question.c_str(), L"强制解除占用", MB_YESNO | MB_ICONWARNING) != IDYES)
+        {
+            return;
+        }
+
+        std::vector<std::wstring> failures;
+        const auto closed = release_handles(g_handles, failures);
+
+        std::wstring status = L"已强制关闭 " + std::to_wstring(closed) + L"/" + std::to_wstring(g_handles.size()) + L" 个句柄";
+        if (!failures.empty())
+        {
+            status += L"（" + std::to_wstring(failures.size()) + L" 个失败，多半是权限不足）";
+        }
+        status += L"，正在重新检查…";
+        set_status(status);
         start_search();
     }
 
@@ -408,25 +461,23 @@ namespace
                 }
             }
 
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < BUTTON_COUNT; ++i)
             {
-                g_buttons[i] = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                               0, 0, 0, 0, hwnd, control_id(IDC_KILL_SELECTED + i), g_instance, nullptr);
+                g_buttons[i] = CreateWindowExW(0, L"BUTTON", g_buttons_spec[i].text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                               0, 0, 0, 0, hwnd, control_id(g_buttons_spec[i].id), g_instance, nullptr);
             }
-            SetWindowTextW(g_buttons[0], L"结束进程");
-            SetWindowTextW(g_buttons[1], L"全部结束");
-            SetWindowTextW(g_buttons[2], L"重新检查");
-            SetWindowTextW(g_buttons[3], L"打开所在位置");
-            SetWindowTextW(g_buttons[4], L"以管理员身份重启");
 
             g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
                                        0, 0, 0, 0, hwnd, control_id(IDC_STATUS), g_instance, nullptr);
 
-            for (HWND control : { g_path_label, g_list, g_status, g_buttons[0], g_buttons[1], g_buttons[2], g_buttons[3], g_buttons[4] })
+            if (g_font)
             {
-                if (g_font)
+                SendMessageW(g_path_label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+                SendMessageW(g_list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+                SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+                for (int i = 0; i < BUTTON_COUNT; ++i)
                 {
-                    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+                    SendMessageW(g_buttons[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
                 }
             }
 
@@ -444,6 +495,7 @@ namespace
             {
             case IDC_KILL_SELECTED: kill_selected(); return 0;
             case IDC_KILL_ALL: kill_all(); return 0;
+            case IDC_FORCE_UNLOCK: force_unlock(); return 0;
             case IDC_REFRESH: start_search(); return 0;
             case IDC_OPEN_LOCATION: open_file_location(); return 0;
             case IDC_ELEVATE: restart_elevated(); return 0;
@@ -526,19 +578,26 @@ namespace
             }
             else
             {
-                g_results = payload->results;
+                g_results = payload->locks.processes;
+                g_handles = payload->locks.handles;
+                g_handles_query_ok = payload->locks.handles_query_ok;
                 fill_list();
 
-                if (g_results.empty())
+                if (!g_handles_query_ok)
+                {
+                    set_status(L"句柄枚举失败：结果不可信，请点“以管理员身份重启”后重试。");
+                }
+                else if (g_results.empty())
                 {
                     set_status(L"没有进程正在占用这些文件。");
                 }
                 else
                 {
-                    std::wstring text = L"找到 " + std::to_wstring(g_results.size()) + L" 个进程正在占用";
+                    std::wstring text = L"找到 " + std::to_wstring(g_results.size()) + L" 个进程正在占用" +
+                                        L"（可强制关闭的文件句柄 " + std::to_wstring(g_handles.size()) + L" 个）";
                     if (!app::is_process_elevated())
                     {
-                        text += L"（有系统进程可能因权限不足而看不到）";
+                        text += L"，系统进程可能因权限不足而看不到";
                     }
                     set_status(text);
                 }

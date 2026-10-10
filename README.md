@@ -86,13 +86,15 @@ FileLocksmith-Standalone/
 
 ### 图形界面
 - 直接双击 `FileLocksmith.exe`；把文件/文件夹**拖进窗口**或**拖到 exe 图标上**；
-- 列表里选中进程 → `结束进程`；`全部结束` 一键清理；双击某行 → 在资源管理器中定位该文件；
+- 列表里选中进程 → `结束进程`；`全部结束` 一键清理；`强制解锁` → 关句柄不杀进程（见第 5 节）；
+  双击某行 → 在资源管理器中定位该文件；
 - 权限不够（系统进程看不到/杀不掉）时点 `以管理员身份重启`。
 
 ### 命令行
 ```powershell
 FileLocksmith.exe report.docx               # 文本列出占用者
 FileLocksmith.exe report.docx --json        # JSON 输出（方便脚本处理）
+FileLocksmith.exe report.docx --unlock      # 强制解除占用（关句柄，不结束进程）
 FileLocksmith.exe C:\build --kill           # 结束所有占用该目录的进程
 FileLocksmith.exe setup.exe --wait --timeout 60000   # 等文件解锁，最多 60 秒
 FileLocksmith.exe --elevate report.docx     # 提权后重开
@@ -118,7 +120,56 @@ FileLocksmith.exe --unregister              # 移除右键菜单项
 
 ---
 
-## 5. 自己编译
+## 5. 强制解除占用（`--unlock` / 「强制解锁」按钮）
+
+不结束进程，直接把**别的进程持有的、指向该文件的文件句柄**关掉，于是锁被释放。
+
+**原理**：
+
+```cpp
+// 复制句柄的同时，把源进程里的那个句柄关掉
+DuplicateHandle(hProcess, (HANDLE)remoteHandle, GetCurrentProcess(),
+                &duplicate, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+```
+
+需要对该进程有 `PROCESS_DUP_HANDLE` 权限 —— 自己启动的进程普通权限即可，系统进程要管理员。
+
+**能做到什么 / 做不到什么**：
+
+| 情况 | 结果 |
+| --- | --- |
+| 进程持有文件句柄（读写文件、日志、数据库文件） | ✅ 可以解除 |
+| 文件被当成 DLL/EXE **映射**进进程（进程列表里有，但句柄数是 0） | ❌ 没有句柄可关，只能结束进程（界面会提示） |
+| 系统进程（需要管理员） | ⚠️ 非管理员会失败并给出错误码，用 `--elevate` 或界面上的「以管理员身份重启」 |
+
+**风险（务必知道）**：
+
+- 关掉别人的句柄 ≈ "不结束程序就直接拔 U 盘"：那个程序之后再访问该句柄会报错，
+  严重时崩溃、丢未保存的数据。界面有二次确认并写明这一点；命令行不会替你确认。
+- 有些程序会立刻重新打开文件（杀毒、索引服务、同步盘），解锁可能只是暂时的。
+- 只对"文件句柄"有效，改动不了别的进程的内存/映射。
+
+**推荐顺序**：`--unlock`（最轻）→ 不行再 `--kill`（结束进程）→ 还不行就说明是映射占用或权限不足。
+
+两个可以组合：`--unlock --kill` 会先尝试关句柄，仍然占用才结束进程。
+
+## 6. 系统要求与兼容性
+
+| 项 | 说明 |
+| --- | --- |
+| 目标版本 | `_WIN32_WINNT=0x0601`（Windows 7 SP1 起），PE 子系统版本 6.0 |
+| **Windows 10** | **支持**。用到的 API 全是 Win7 就有的：`NtQuerySystemInformation`(class 64)、`NtQueryObject`、`DuplicateHandle`、`EnumProcessModules`、`LookupAccountSid`、`OpenProcessToken`；manifest 里声明了 Win8.1/Win10/Win11 的 `supportedOS` GUID |
+| Windows 11 | 支持 |
+| 架构 | x64（ARM64 设备走 x64 模拟；也可自行用 llvm-mingw 编 ARM64） |
+| 运行依赖 | 无。静态链接 CRT，不需要 .NET / Windows App SDK / VC++ 运行时 |
+| 实测环境 | Windows Server 2022（10.0.20348，与 Win10 同一 NT 10.0 代）；`--version` 会打印它所在系统的版本号 |
+
+> CI 已经**不再提供 Windows 10 的 runner**（`windows-2019` 已下线，只剩 Server 2022/2025 和 Win11-ARM），
+> 所以"适配 Win10"的依据是：目标版本/子系统版本声明 + 只用 Win7 起的 API + manifest 兼容性声明，
+> 并且 CI 会守住这几条（`Smoke test` 里断言 PE 机器类型、子系统版本、supportedOS GUID）。
+> 真机若在 Win10 上出问题，`--version` 的输出（含系统版本）可以直接贴进 issue。
+
+## 7. 自己编译
 
 ### Windows + Visual Studio 2022（推荐，产出 x64）
 ```bat
@@ -146,7 +197,7 @@ cmake --build build -j
 
 ---
 
-## 6. 关于右键菜单（和原版的最大差别）
+## 8. 关于右键菜单（和原版的最大差别）
 
 - `--register` 写的是 `HKCU\Software\Classes\*\shell\FileLocksmith`（传统 verb）。
   Windows 10 直接可见；**Windows 11 需要点"显示更多选项"（Shift+F10）**才会出现在经典菜单里。
@@ -159,7 +210,7 @@ cmake --build build -j
 
 ---
 
-## 7. 体积与依赖对比
+## 9. 体积与依赖对比
 
 | | 原版模块 | 本独立版 |
 | --- | --- | --- |
@@ -170,7 +221,7 @@ cmake --build build -j
 
 ---
 
-## 8. 已知限制
+## 10. 已知限制
 
 1. **提权才能看全**：非管理员下，部分系统级进程的句柄 `OpenProcess`/`DuplicateHandle` 会失败，
    结果会偏少。程序启动时会尝试开启 `SeDebugPrivilege`，但不是万能药；界面上有"以管理员身份重启"。
@@ -179,15 +230,19 @@ cmake --build build -j
 3. **枚举有开销**：每次查询都要遍历全系统句柄表，机械盘/句柄多的机器上可能几秒。
    GUI 里这个工作放在后台线程，不会卡界面。
 4. **结束进程 = `TerminateProcess`**：没有"保存数据"的优雅退出，界面上有二次确认。
-5. **不做持久化**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
-6. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
-   放在冒烟测试里 —— CI 的 `windows-2022` job 会真的创建一个被独占占用的文件，
-   断言 exe 能报出占用者的 PID 与用户名，再用 `--kill` 断言占用进程确实被结束。
-   这部分逻辑本身没在 Windows 上手点过（GUI 窗口的交互尤其没有），有问题请提 issue。
+   「强制解锁」同样有副作用（关别人的句柄），见第 5 节。
+5. **图形界面没有自动化测试**：CI 只覆盖命令行与核心逻辑（真机端到端），
+   按钮点击、拖放、列表交互这些只能靠手点 —— 「打开所在位置」按钮的 ID 串位 bug 就是这么漏出去的，
+   1.1.0 已修（见 CHANGELOG）。
+6. **不做持久化**：没有设置文件、没有日志、没有遥测（这也是它能缩到 1 MB 的原因）。
+7. **运行时验证靠 CI**：开发沙箱是 Linux(aarch64)，编不出也跑不了 Windows 程序，所以真机验证
+   放在冒烟测试里 —— CI 的 `windows-2022` job 会真的创建一个被独占占用的文件，断言 exe 能报出
+   占用者的 PID 与用户名；再用 `--kill` 断言占用进程被结束；用 `--unlock` 断言文件被解锁
+   而持有它的进程仍然活着。GUI 窗口的交互（点击、拖放）CI 覆盖不到，有问题请提 issue。
 
 ---
 
-## 9. CI 与发布
+## 11. CI 与发布
 
 `.github/workflows/ci.yml` 在 push 到 `main` 后自动跑：
 
@@ -216,7 +271,7 @@ git add -A && git commit -m "chore: 发布 1.1.0" && git push origin main
 
 tag 已存在时 `release` job 只编译不重发，避免重复发布。
 
-## 10. 许可
+## 12. 许可
 
 衍生自 Microsoft PowerToys（MIT License，Copyright (c) Microsoft Corporation），
 完整许可证见 `LICENSE-PowerToys-MIT.txt`。保留原版权声明即可自由用于商业/非商业项目。

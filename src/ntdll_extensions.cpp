@@ -146,12 +146,22 @@ std::wstring NtdllExtensions::path_to_kernel_name(LPCWSTR path)
     return kernel_name;
 }
 
-std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles() noexcept
+std::vector<NtdllExtensions::HandleInfo> NtdllExtensions::handles(bool* ok) noexcept
 {
+    if (ok != nullptr)
+    {
+        *ok = false;
+    }
+
     auto get_info_result = NtQuerySystemInformationMemoryLoop(SystemExtendedHandleInformationClass);
     if (NT_ERROR(get_info_result.status))
     {
         return {};
+    }
+
+    if (ok != nullptr)
+    {
+        *ok = true;
     }
 
     auto info_ptr = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(get_info_result.memory.data());
@@ -335,13 +345,23 @@ std::wstring NtdllExtensions::pid_to_user(DWORD pid)
     return user;
 }
 
-std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes() noexcept
+std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes(bool* ok) noexcept
 {
+    if (ok != nullptr)
+    {
+        *ok = false;
+    }
+
     auto get_info_result = NtQuerySystemInformationMemoryLoop(SystemProcessInformation);
 
     if (NT_ERROR(get_info_result.status))
     {
         return {};
+    }
+
+    if (ok != nullptr)
+    {
+        *ok = true;
     }
 
     std::vector<ProcessInfo> result;

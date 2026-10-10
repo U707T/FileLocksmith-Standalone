@@ -45,9 +45,12 @@ public:
     // Gives the user name of the account running this process
     std::wstring pid_to_user(DWORD pid);
 
-    std::vector<HandleInfo> handles() noexcept;
+    // Returns the list of handles currently existing in the system.
+    // *ok is set to false when the query itself failed (so the caller can tell
+    // "cannot enumerate" apart from "nothing is holding the file").
+    std::vector<HandleInfo> handles(bool* ok = nullptr) noexcept;
 
     // Returns the list of all processes.
-    // On failure, returns an empty vector.
-    std::vector<ProcessInfo> processes() noexcept;
+    // On failure, returns an empty vector and sets *ok to false.
+    std::vector<ProcessInfo> processes(bool* ok = nullptr) noexcept;
 };

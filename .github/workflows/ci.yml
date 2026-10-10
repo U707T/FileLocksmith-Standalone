@@ -35,15 +35,39 @@ jobs:
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Copy-Item build\Release\FileLocksmith.exe out\FileLocksmith-x64.exe
           (Get-Item out\FileLocksmith-x64.exe).VersionInfo | Format-List FileVersion, ProductVersion, FileDescription
-      - name: Smoke test (--version 与 VERSION 文件一致)
+      - name: Smoke test (版本号 + 系统兼容性声明)
         shell: pwsh
         run: |
           $expected = (Get-Content VERSION -Raw).Trim()
           $exe = (Resolve-Path 'out\FileLocksmith-x64.exe').Path
-          $actual = (& $exe --version | Out-String).Trim()
+
+          # 用 cmd 包一层：PowerShell 会把 Windows 子系统的 exe 当图形程序，不等待也不捕获输出
+          $actual = (& cmd /c "`"$exe`" --version" | Out-String).Trim()
           Write-Host "VERSION 文件: $expected"
-          Write-Host "--version 输出: $actual"
+          Write-Host "--version 输出:"
+          Write-Host $actual
           if ($actual -notmatch [regex]::Escape($expected)) { throw "版本号不一致" }
+
+          # 声明兼容 Win10：manifest 里必须有对应 supportedOS GUID（Windows 靠它决定版本相关行为）
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          foreach ($guid in @('8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a', '1f676c76-80e1-4239-95bb-83d0f6d0da78')) {
+            if ($text -notmatch $guid) { throw "manifest 缺少 supportedOS GUID $guid" }
+          }
+          Write-Host "manifest: 已声明 Windows 8.1 / 10 / 11 兼容"
+
+          # PE 头：必须是 x64，且子系统版本不能高过 Vista(6.0)，否则老系统直接拒绝加载
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 0x4)
+          $optHeader = $peOffset + 24
+          $subsystemMajor = [BitConverter]::ToUInt16($bytes, $optHeader + 0x30)
+          $subsystemMinor = [BitConverter]::ToUInt16($bytes, $optHeader + 0x32)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optHeader + 0x44)
+          Write-Host ("PE: machine=0x{0:X4} subsystem={1} subsystemVersion={2}.{3}" -f $machine, $subsystem, $subsystemMajor, $subsystemMinor)
+          if ($machine -ne 0x8664) { throw "不是 x64 产物 (machine=0x{0:X4})" -f $machine }
+          if ($subsystem -ne 2) { throw "不是 Windows GUI 子系统（双击会闪控制台）" }
+          if ($subsystemMajor -gt 6) { throw "子系统版本 $subsystemMajor.$subsystemMinor 要求比 Vista 更新的系统" }
+
       # 真机端到端自测：找占用者 + 结束占用者
       # 真机端到端自测：找占用者 + 结束占用者
       #
@@ -121,6 +145,33 @@ jobs:
           Write-Host "用例 3 查询 stdout: $($r4.StdOut.Trim())"
           if ($r4.StdOut -match '"pid"') { throw "用例 3 失败：进程都结束了却仍报告占用" }
           Write-Host "用例 3 通过：无占用"
+
+          # --- 用例 4：强制解除占用（关闭别人的句柄，但不结束进程）---
+          $blocker2 = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile','-NonInteractive','-Command',
+            "`$f=[System.IO.File]::Open('$file','Open','ReadWrite','None'); Start-Sleep -Seconds 300"
+          )
+          Start-Sleep -Seconds 5
+          $r5 = Invoke-FL @($file, '--unlock', '--cli')
+          Write-Host "用例 4：阻塞进程 PID = $($blocker2.Id)"
+          Write-Host "  --unlock stdout: $($r5.StdOut.Trim())"
+          if ($r5.ExitCode -ne 0) { throw "用例 4 失败：退出码 $($r5.ExitCode)" }
+          if ($r5.StdOut -notmatch '已强制关闭 [1-9]') { throw "用例 4 失败：一个句柄都没关掉" }
+          Start-Sleep -Seconds 1
+          if ($blocker2.HasExited) {
+            Stop-Process -Id $blocker2.Id -Force -ErrorAction SilentlyContinue
+            throw "用例 4 失败：阻塞进程被结束了，强制解锁不应该结束进程"
+          }
+          $stillLocked = $false
+          try {
+            $probe = [System.IO.File]::Open($file, 'Open', 'ReadWrite', 'None')
+            $probe.Close(); $probe.Dispose()
+          } catch {
+            $stillLocked = $true
+          }
+          Stop-Process -Id $blocker2.Id -Force -ErrorAction SilentlyContinue
+          if ($stillLocked) { throw "用例 4 失败：句柄关掉了，但文件仍打不开" }
+          Write-Host "用例 4 通过：文件已解锁，而进程 $($blocker2.Id) 仍然活着"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

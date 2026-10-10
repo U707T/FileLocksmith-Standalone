@@ -14,9 +14,11 @@ static constexpr bool starts_with(std::wstring_view whole, std::wstring_view par
     return whole.size() >= part.size() && whole.substr(0, part.size()) == part;
 }
 
-std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstring>& paths)
+LocksmithResult find_locks(const std::vector<std::wstring>& paths)
 {
     NtdllExtensions nt_ext;
+
+    LocksmithResult result;
 
     // This maps kernel names of files within `paths` to their normal paths.
     std::map<std::wstring, std::wstring> kernel_names_files;
@@ -61,20 +63,25 @@ std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstri
         return {};
     };
 
-    for (const auto& handle_info : nt_ext.handles())
+    for (const auto& handle_info : nt_ext.handles(&result.handles_query_ok))
     {
         if (handle_info.type_name == L"File")
         {
             auto path = kernel_paths_contain(handle_info.kernel_file_name);
             if (!path.empty())
             {
-                pid_files[handle_info.pid].insert(std::move(path));
+                pid_files[handle_info.pid].insert(path);
+                result.handles.push_back(LockedHandle{
+                    static_cast<DWORD>(handle_info.pid),
+                    handle_info.handle,
+                    path,
+                    handle_info.kernel_file_name });
             }
         }
     }
 
     // Check all modules used by processes
-    auto processes = nt_ext.processes();
+    auto processes = nt_ext.processes(&result.processes_query_ok);
 
     for (const auto& process : processes)
     {
@@ -90,13 +97,11 @@ std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstri
         }
     }
 
-    std::vector<ProcessResult> result;
-
     for (const auto& process_info : processes)
     {
         if (auto it = pid_files.find(process_info.pid); it != pid_files.end())
         {
-            result.push_back(ProcessResult{
+            result.processes.push_back(ProcessResult{
                 process_info.name,
                 process_info.pid,
                 process_info.user,
@@ -105,6 +110,103 @@ std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstri
     }
 
     return result;
+}
+
+std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstring>& paths)
+{
+    return find_locks(paths).processes;
+}
+
+namespace
+{
+    std::wstring to_hex(ULONG_PTR value)
+    {
+        const wchar_t* digits = L"0123456789abcdef";
+        std::wstring text;
+        bool started = false;
+        for (int shift = static_cast<int>(sizeof(ULONG_PTR) * 8) - 4; shift >= 0; shift -= 4)
+        {
+            auto nibble = static_cast<unsigned>((value >> shift) & 0xF);
+            if (nibble != 0 || started || shift == 0)
+            {
+                started = true;
+                text.push_back(digits[nibble]);
+            }
+        }
+        return L"0x" + text;
+    }
+}
+
+size_t release_handles(const std::vector<LockedHandle>& handles, std::vector<std::wstring>& failures)
+{
+    size_t closed = 0;
+
+    // 同一个进程只 OpenProcess 一次
+    std::map<DWORD, HANDLE> process_cache;
+    // 打开失败的进程只报一次错（同一个 PID 的多个句柄不必刷屏）
+    std::map<DWORD, DWORD> open_errors;
+
+    for (const auto& item : handles)
+    {
+        HANDLE process = nullptr;
+        if (auto it = process_cache.find(item.pid); it != process_cache.end())
+        {
+            process = it->second;
+        }
+        else
+        {
+            process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, item.pid);
+            process_cache[item.pid] = process;
+            if (process == nullptr)
+            {
+                open_errors[item.pid] = GetLastError();
+            }
+        }
+
+        if (process == nullptr)
+        {
+            if (auto it = open_errors.find(item.pid); it != open_errors.end() && it->second != 0)
+            {
+                failures.push_back(L"PID " + std::to_wstring(item.pid) + L": 无法打开进程 (错误码 " +
+                                   std::to_wstring(it->second) + L")，需要管理员权限？");
+                it->second = 0;
+            }
+            continue;
+        }
+
+        // DUPLICATE_CLOSE_SOURCE 会在复制的同时关掉源进程里的那个句柄，
+        // 于是它持有的文件锁就被释放了 —— 进程本身不受影响（但那个句柄值作废）。
+        HANDLE duplicate = nullptr;
+        if (DuplicateHandle(process,
+                            reinterpret_cast<HANDLE>(item.handle),
+                            GetCurrentProcess(),
+                            &duplicate,
+                            0,
+                            FALSE,
+                            DUPLICATE_CLOSE_SOURCE))
+        {
+            if (duplicate != nullptr)
+            {
+                CloseHandle(duplicate);
+            }
+            ++closed;
+        }
+        else
+        {
+            failures.push_back(L"PID " + std::to_wstring(item.pid) + L" 句柄 " + to_hex(item.handle) +
+                               L": 关闭失败 (错误码 " + std::to_wstring(GetLastError()) + L")");
+        }
+    }
+
+    for (auto& [pid, process] : process_cache)
+    {
+        if (process != nullptr)
+        {
+            CloseHandle(process);
+        }
+    }
+
+    return closed;
 }
 
 constexpr size_t LongMaxPathSize = 65536;

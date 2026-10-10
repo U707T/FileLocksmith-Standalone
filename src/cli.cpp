@@ -24,6 +24,7 @@ namespace
         text += L"选项:\n";
         text += L"  --json             以 JSON 输出结果\n";
         text += L"  --kill             结束所有占用这些文件的进程\n";
+        text += L"  --unlock           强制解除占用（关闭别的进程持有的文件句柄，不结束进程）\n";
         text += L"  --wait             等待直到文件被解锁\n";
         text += L"  --timeout <毫秒>   --wait 的超时时间\n";
         text += L"  --gui              强制打开图形界面\n";
@@ -193,7 +194,7 @@ namespace
 
     bool is_cli_flag(const std::wstring& arg)
     {
-        return arg == L"--json" || arg == L"--kill" || arg == L"--wait" || arg == L"--timeout" ||
+        return arg == L"--json" || arg == L"--kill" || arg == L"--unlock" || arg == L"--wait" || arg == L"--timeout" ||
                arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
                arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
     }
@@ -218,6 +219,7 @@ int cli_main(const std::vector<std::wstring>& args)
 {
     bool json_output = false;
     bool kill = false;
+    bool unlock = false;
     bool wait = false;
     bool elevate = false;
     int timeout_ms = -1;
@@ -233,6 +235,10 @@ int cli_main(const std::vector<std::wstring>& args)
         else if (arg == L"--kill")
         {
             kill = true;
+        }
+        else if (arg == L"--unlock")
+        {
+            unlock = true;
         }
         else if (arg == L"--wait")
         {
@@ -267,6 +273,8 @@ int cli_main(const std::vector<std::wstring>& args)
         else if (arg == L"--version")
         {
             app::out(std::wstring(ProductName) + L" " + product_version() + L"\n");
+            app::out(L"运行环境: " + app::os_friendly_name() + L" (" + app::os_version_string() + L")\n");
+            app::out(std::wstring(L"管理员权限: ") + (app::is_process_elevated() ? L"是" : L"否") + L"\n");
             return 0;
         }
         else if (arg == L"--register")
@@ -359,10 +367,10 @@ int cli_main(const std::vector<std::wstring>& args)
         }
     }
 
-    std::vector<ProcessResult> results;
+    LocksmithResult locks;
     try
     {
-        results = find_processes_recursive(paths);
+        locks = find_locks(paths);
     }
     catch (const std::exception& ex)
     {
@@ -370,7 +378,48 @@ int cli_main(const std::vector<std::wstring>& args)
         return 1;
     }
 
+    std::vector<ProcessResult> results = locks.processes;
     std::wstring output;
+
+    if (!locks.handles_query_ok)
+    {
+        output += L"警告: 句柄枚举失败，“没有占用”这个结论不可信（可试试 --elevate）。\n";
+    }
+
+    // 1) 先尝试强制解除占用（关句柄，不结束进程）
+    if (unlock)
+    {
+        if (locks.handles.empty())
+        {
+            output += L"没有找到可强制关闭的文件句柄。\n";
+        }
+        else
+        {
+            std::vector<std::wstring> failures;
+            const auto closed = release_handles(locks.handles, failures);
+            output += L"已强制关闭 " + std::to_wstring(closed) + L"/" + std::to_wstring(locks.handles.size()) +
+                      L" 个文件句柄（进程没有被结束，但持有它的程序可能出现异常，请自行确认）。\n";
+            for (const auto& failure : failures)
+            {
+                output += L"  ! " + failure + L"\n";
+            }
+        }
+
+        try
+        {
+            locks = find_locks(paths);
+            results = locks.processes;
+        }
+        catch (const std::exception&)
+        {
+            results.clear();
+        }
+
+        output += results.empty() ? L"文件已经解锁。\n"
+                                  : L"仍然被 " + std::to_wstring(results.size()) + L" 个进程占用（可用 --kill 结束它们，或用 --elevate 提权后重试）。\n";
+    }
+
+    // 2) 仍然占用时，按需结束进程
     if (kill)
     {
         output += kill_processes(results);

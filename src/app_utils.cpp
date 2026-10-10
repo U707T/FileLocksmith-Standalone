@@ -127,6 +127,89 @@ namespace app
         return result;
     }
 
+    namespace
+    {
+        // GetVersionExW lies unless the manifest declares supportedOS entries;
+        // RtlGetVersion always reports the real build number. Not a documented
+        // Win32 API, but it is stable and used by every diagnostic tool.
+        bool query_os_version(DWORD& major, DWORD& minor, DWORD& build)
+        {
+            using RtlGetVersion_t = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+            auto get_version = reinterpret_cast<RtlGetVersion_t>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+            if (get_version == nullptr)
+            {
+                return false;
+            }
+
+            RTL_OSVERSIONINFOW info{};
+            info.dwOSVersionInfoSize = sizeof(info);
+            if (get_version(&info) != 0)
+            {
+                return false;
+            }
+
+            major = info.dwMajorVersion;
+            minor = info.dwMinorVersion;
+            build = info.dwBuildNumber;
+            return true;
+        }
+    }
+
+    std::wstring os_version_string()
+    {
+        DWORD major = 0, minor = 0, build = 0;
+        if (!query_os_version(major, minor, build))
+        {
+            return L"未知";
+        }
+        return std::to_wstring(major) + L"." + std::to_wstring(minor) + L"." + std::to_wstring(build);
+    }
+
+    std::wstring os_friendly_name()
+    {
+        DWORD major = 0, minor = 0, build = 0;
+        if (!query_os_version(major, minor, build))
+        {
+            return L"未知系统";
+        }
+
+        switch (build)
+        {
+        case 7601: return L"Windows 7 SP1";
+        case 9600: return L"Windows 8.1";
+        case 10240: return L"Windows 10 1507";
+        case 10586: return L"Windows 10 1511";
+        case 14393: return L"Windows 10 1607 / Server 2016";
+        case 15063: return L"Windows 10 1703";
+        case 16299: return L"Windows 10 1709";
+        case 17134: return L"Windows 10 1803";
+        case 17763: return L"Windows 10 1809 / Server 2019";
+        case 18362: return L"Windows 10 1903";
+        case 18363: return L"Windows 10 1909";
+        case 19041: return L"Windows 10 2004";
+        case 19042: return L"Windows 10 20H2";
+        case 19043: return L"Windows 10 21H1";
+        case 19044: return L"Windows 10 21H2";
+        case 19045: return L"Windows 10 22H2";
+        case 20348: return L"Windows Server 2022";
+        case 22000: return L"Windows 11 21H2";
+        case 22621: return L"Windows 11 22H2";
+        case 22631: return L"Windows 11 23H2";
+        case 26100: return L"Windows 11 24H2 / Server 2025";
+        default: break;
+        }
+
+        if (major == 10 && build >= 22000)
+        {
+            return L"Windows 11 (较新版本)";
+        }
+        if (major == 10)
+        {
+            return L"Windows 10 (较新版本)";
+        }
+        return L"Windows " + std::to_wstring(major) + L"." + std::to_wstring(minor);
+    }
+
     std::wstring to_wstring(const char* utf8_text)
     {
         if (utf8_text == nullptr || *utf8_text == '\0')

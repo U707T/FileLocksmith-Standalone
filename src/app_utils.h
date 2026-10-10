@@ -27,6 +27,10 @@ namespace app
     std::wstring quote_arg(const std::wstring& arg);
     bool relaunch_elevated(const std::vector<std::wstring>& args);
 
+    // ---- 操作系统版本（--version 与排障用）---------------------------------
+    std::wstring os_version_string();  // 例如 "10.0.19045"
+    std::wstring os_friendly_name();   // 例如 "Windows 10 22H2"
+
     // ---- misc -------------------------------------------------------------
     std::string to_utf8(const std::wstring& text);
     std::wstring to_wstring(const char* utf8_text);
