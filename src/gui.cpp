@@ -43,6 +43,13 @@ namespace
         std::wstring error;
     };
 
+    // Control IDs are passed through the HMENU parameter of CreateWindowExW;
+    // the INT_PTR round trip keeps 64-bit MSVC happy (C4312).
+    inline HMENU control_id(int id)
+    {
+        return reinterpret_cast<HMENU>(static_cast<INT_PTR>(id));
+    }
+
     std::wstring join(const std::vector<std::wstring>& items, const wchar_t* separator)
     {
         std::wstring result;
@@ -382,11 +389,11 @@ namespace
             }
 
             g_path_label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PATH_LABEL), g_instance, nullptr);
+                                           0, 0, 0, 0, hwnd, control_id(IDC_PATH_LABEL), g_instance, nullptr);
 
             g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                                     0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LIST), g_instance, nullptr);
+                                     0, 0, 0, 0, hwnd, control_id(IDC_LIST), g_instance, nullptr);
             ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
             {
                 const wchar_t* titles[4] = { L"PID", L"进程", L"用户", L"占用的文件" };
@@ -404,7 +411,7 @@ namespace
             for (int i = 0; i < 5; ++i)
             {
                 g_buttons[i] = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                               0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_KILL_SELECTED + i), g_instance, nullptr);
+                                               0, 0, 0, 0, hwnd, control_id(IDC_KILL_SELECTED + i), g_instance, nullptr);
             }
             SetWindowTextW(g_buttons[0], L"结束进程");
             SetWindowTextW(g_buttons[1], L"全部结束");
@@ -413,7 +420,7 @@ namespace
             SetWindowTextW(g_buttons[4], L"以管理员身份重启");
 
             g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-                                       0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), g_instance, nullptr);
+                                       0, 0, 0, 0, hwnd, control_id(IDC_STATUS), g_instance, nullptr);
 
             for (HWND control : { g_path_label, g_list, g_status, g_buttons[0], g_buttons[1], g_buttons[2], g_buttons[3], g_buttons[4] })
             {

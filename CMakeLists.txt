@@ -39,6 +39,11 @@ if (MSVC)
     # Keep the Windows subsystem (no console flash on double click) but use the
     # plain "main" entry point so the same code can serve as a CLI tool.
     target_link_options(FileLocksmith PRIVATE /ENTRY:mainCRTStartup)
+    # res/resource.rc already embeds the full application manifest (ComCtl32 v6,
+    # DPI awareness, asInvoker) - the same file MinGW-w64 uses. Tell the linker
+    # not to generate a second one, otherwise CVTRES fails with
+    # "CVT1100: duplicate resource. type:MANIFEST, name:1".
+    target_link_options(FileLocksmith PRIVATE /MANIFEST:NO)
 else()
     target_compile_options(FileLocksmith PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_options(FileLocksmith PRIVATE -static -static-libgcc -static-libstdc++ -Wl,-e,mainCRTStartup)
