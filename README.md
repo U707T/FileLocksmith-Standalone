@@ -104,6 +104,18 @@ FileLocksmith.exe --unregister              # 移除右键菜单项
 → 命令行模式；否则（双击、右键"打开方式"、右键菜单）→ 图形界面。
 所以从资源管理器启动永远不会闪黑框。
 
+> ⚠️ **PowerShell 用户注意**：这个 exe 是 Windows 子系统（为了双击不闪黑框），
+> PowerShell 7 会把它判定为图形程序 —— `& .\FileLocksmith.exe f.txt --json` 这种写法
+> **不会等待、也不会把输出装进变量**（`$LASTEXITCODE` 为空）。要拿输出请改用：
+>
+> ```powershell
+> $json = & cmd /c 'FileLocksmith.exe "f.txt" --json'      # 用 cmd 包一层
+> # 或
+> Start-Process FileLocksmith.exe -ArgumentList 'f.txt','--json' -Wait -RedirectStandardOutput out.json
+> ```
+>
+> `cmd.exe` 里直接用则没有这个问题（cmd 一律等待子进程）。
+
 ---
 
 ## 5. 自己编译
