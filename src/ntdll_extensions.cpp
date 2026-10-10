@@ -38,15 +38,48 @@ namespace
 
     constexpr size_t DefaultModulesResultSize = 512;
 
-    std::vector<std::wstring> process_modules(DWORD pid)
+    struct ProcessDetails
     {
-        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (!process)
+        std::wstring image_path;
+        std::vector<std::wstring> modules;
+    };
+
+    // 只要镜像路径时走这条：PROCESS_QUERY_LIMITED_INFORMATION 比 VM_READ 便宜得多
+    std::wstring process_image_path(DWORD pid)
+    {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr)
         {
             return {};
         }
 
-        std::vector<std::wstring> result;
+        std::wstring buffer(MAX_PATH * 2, L'\0');
+        DWORD size = static_cast<DWORD>(buffer.size());
+        std::wstring result;
+        if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size) != 0)
+        {
+            buffer.resize(size);
+            result = std::move(buffer);
+        }
+
+        CloseHandle(process);
+        return result;
+    }
+
+    // 一次 OpenProcess 同时拿到主模块路径与模块列表（比开两次省一半系统调用）
+    ProcessDetails process_details(DWORD pid)
+    {
+        ProcessDetails details;
+
+        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!process)
+        {
+            return details;
+        }
+
+        details.image_path = get_module_name(process, nullptr);
+
+        std::vector<std::wstring>& result = details.modules;
 
         bool completed = false;
         std::vector<HMODULE> modules(DefaultModulesResultSize);
@@ -58,8 +91,9 @@ namespace
             if (!status)
             {
                 // Give up
+                details.modules.clear();
                 CloseHandle(process);
-                return {};
+                return details;
             }
 
             if (needed > modules.size() * sizeof(HMODULE))
@@ -85,7 +119,7 @@ namespace
         }
 
         CloseHandle(process);
-        return result;
+        return details;
     }
 }
 
@@ -356,6 +390,11 @@ std::wstring NtdllExtensions::pid_to_user(DWORD pid)
 
 std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes(bool* ok) noexcept
 {
+    return processes_ex(ok, /* include_modules */ true);
+}
+
+std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes_ex(bool* ok, bool include_modules) noexcept
+{
     if (ok != nullptr)
     {
         *ok = false;
@@ -383,7 +422,19 @@ std::vector<NtdllExtensions::ProcessInfo> NtdllExtensions::processes(bool* ok) n
         ProcessInfo item;
         item.name = unicode_to_str(info_ptr->ImageName);
         item.pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(info_ptr->UniqueProcessId));
-        item.modules = process_modules(item.pid);
+        item.parent_pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(info_ptr->InheritedFromUniqueProcessId));
+
+        if (include_modules)
+        {
+            auto details = process_details(item.pid);
+            item.image_path = std::move(details.image_path);
+            item.modules = std::move(details.modules);
+        }
+        else
+        {
+            item.image_path = process_image_path(item.pid);
+        }
+
         item.user = pid_to_user(item.pid);
 
         result.push_back(item);

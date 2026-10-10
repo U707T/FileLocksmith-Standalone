@@ -84,6 +84,19 @@ namespace shell_integration
         }
     }
 
+    std::wstring extension_of(const std::wstring& path)
+    {
+        const auto dot = path.find_last_of(L'.');
+        if (dot == std::wstring::npos)
+        {
+            return {};
+        }
+        std::wstring extension = path.substr(dot);
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+        return extension;
+    }
+
     std::wstring sendto_folder()
     {
         // %APPDATA%\Microsoft\Windows\SendTo 就是「发送到」菜单目录，
@@ -173,6 +186,57 @@ namespace shell_integration
             return false;
         }
         return create_shortcut(path, exe, L"");
+    }
+
+    bool is_shortcut(const std::wstring& path)
+    {
+        return extension_of(path) == L".lnk";
+    }
+
+    bool is_executable(const std::wstring& path)
+    {
+        const auto extension = extension_of(path);
+        return extension == L".exe" || extension == L".com" || extension == L".bat" || extension == L".cmd";
+    }
+
+    bool resolve_shortcut(const std::wstring& link_path, std::wstring& target, std::wstring& arguments)
+    {
+        const HRESULT com_status = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+        bool ok = false;
+        IShellLinkW* link = nullptr;
+        if (SUCCEEDED(CoCreateInstance(ShellLinkClsid, nullptr, CLSCTX_INPROC_SERVER, ShellLinkIid, reinterpret_cast<void**>(&link))))
+        {
+            IPersistFile* file = nullptr;
+            if (SUCCEEDED(link->QueryInterface(PersistFileIid, reinterpret_cast<void**>(&file))))
+            {
+                if (SUCCEEDED(file->Load(link_path.c_str(), STGM_READ)))
+                {
+                    std::vector<wchar_t> buffer(MAX_PATH * 2, L'\0');
+                    WIN32_FIND_DATAW find_data{};
+                    if (link->GetPath(buffer.data(), static_cast<int>(buffer.size()), &find_data, SLGP_UNCPRIORITY) == S_OK &&
+                        buffer[0] != L'\0')
+                    {
+                        target = buffer.data();
+                        ok = !target.empty();
+                    }
+
+                    std::vector<wchar_t> argument_buffer(MAX_PATH * 2, L'\0');
+                    if (ok && link->GetArguments(argument_buffer.data(), static_cast<int>(argument_buffer.size())) == S_OK)
+                    {
+                        arguments = argument_buffer.data();
+                    }
+                }
+                file->Release();
+            }
+            link->Release();
+        }
+
+        if (SUCCEEDED(com_status))
+        {
+            CoUninitialize();
+        }
+        return ok;
     }
 
     bool open_sendto_folder()

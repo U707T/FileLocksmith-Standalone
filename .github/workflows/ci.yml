@@ -228,6 +228,64 @@ jobs:
           if ($r10.StdOut.Trim() -notmatch '^\{.*\}$') { throw "用例 8 失败：stdout 里混进了非 JSON 内容" }
           if ($r10.StdErr -notmatch '已强制关闭') { throw "用例 8 失败：诊断信息没有走 stderr" }
           Write-Host "用例 8 通过：stdout 只有一行 JSON，诊断信息在 stderr"
+
+          # --- 用例 9：拖动应用快捷方式 → 展开成整棵进程树 → 全部结束 ---
+          # 用唯一名字的副本，避免误伤系统里的 cmd.exe / ping.exe
+          $appDir = Join-Path $env:RUNNER_TEMP 'fl-app-test'
+          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+          $appExe = Join-Path $appDir 'fl-app.exe'
+          $childExe = Join-Path $appDir 'fl-child.exe'
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" $appExe -Force
+          Copy-Item "$env:SystemRoot\System32\ping.exe" $childExe -Force
+          Set-Content -Path (Join-Path $appDir 'run.bat') -Value "`"$childExe`" -n 300 127.0.0.1" -Encoding ASCII
+
+          $link = Join-Path $appDir 'fl-app.lnk'
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut($link)
+          $shortcut.TargetPath = $appExe
+          $shortcut.Save()
+
+          $root = Start-Process -FilePath $appExe -ArgumentList @('/c', (Join-Path $appDir 'run.bat')) -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          $child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($root.Id)" -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "用例 9：根进程 $($root.Id)，子进程 $($child.ProcessId)"
+          if (-not $child) { throw "用例 9 失败：没造出父子进程对" }
+
+          $r11 = Invoke-FL @($link, '--json', '--cli')
+          Write-Host "  stdout: $($r11.StdOut.Trim())"
+          if ($r11.StdOut -notmatch "`"pid`":\s*$($root.Id)\b") { throw "用例 9 失败：没报出根进程 $($root.Id)" }
+          if ($r11.StdOut -notmatch "`"pid`":\s*$($child.ProcessId)\b") { throw "用例 9 失败：没展开出子进程 $($child.ProcessId)" }
+
+          $r12 = Invoke-FL @($link, '--kill', '--cli')
+          Write-Host "  --kill stdout: $($r12.StdOut.Trim())"
+          Start-Sleep -Seconds 3
+          $rootAlive = $null -ne (Get-Process -Id $root.Id -ErrorAction SilentlyContinue)
+          $childAlive = $null -ne (Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue)
+          if ($rootAlive -or $childAlive) {
+            Stop-Process -Id $root.Id, $child.ProcessId -Force -ErrorAction SilentlyContinue
+            throw "用例 9 失败：进程树没被全部结束（root=$rootAlive child=$childAlive）"
+          }
+          Write-Host "用例 9 通过：快捷方式展开出父子进程，并全部结束"
+          Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          # --- 用例 10：--delete 删除被占用的文件（先关句柄，不结束进程）---
+          $victim = Join-Path $dir 'to-delete.txt'
+          Set-Content -Path $victim -Value 'bye'
+          $locker4 = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile','-NonInteractive','-Command',
+            "`$f=[System.IO.File]::Open('$victim','Open','ReadWrite','None'); Start-Sleep -Seconds 300"
+          )
+          Start-Sleep -Seconds 5
+          $r13 = Invoke-FL @($victim, '--delete', '--cli')
+          Write-Host "  --delete stdout: $($r13.StdOut.Trim())"
+          Write-Host "  --delete 退出码: $($r13.ExitCode)"
+          $stillThere = Test-Path -LiteralPath $victim
+          $lockerAlive = -not $locker4.HasExited
+          Stop-Process -Id $locker4.Id -Force -ErrorAction SilentlyContinue
+          if ($r13.ExitCode -ne 0) { throw "用例 10 失败：退出码 $($r13.ExitCode)" }
+          if ($stillThere) { throw "用例 10 失败：被占用的文件没删掉" }
+          if (-not $lockerAlive) { throw "用例 10 失败：占用进程被杀了，--delete 只应该关句柄" }
+          Write-Host "用例 10 通过：被占用的文件已删除，占用进程仍在运行"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

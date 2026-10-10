@@ -43,5 +43,16 @@ std::vector<ProcessResult> find_processes_recursive(const std::vector<std::wstri
 // 返回成功关闭的句柄数；failures 里是每个失败的原因。
 size_t release_handles(const std::vector<LockedHandle>& handles, std::vector<std::wstring>& failures);
 
-// Gives the full path of the executable, given the process id
-std::wstring pid_to_full_path(DWORD pid);
+// 把一个 exe 路径展开成"这个程序的所有进程"：镜像路径匹配的进程，
+// include_children=true 时再加上它们的子进程、孙进程……
+std::vector<ProcessResult> find_application_processes(const std::wstring& executable, bool include_children);
+
+// 把 extra 里的进程合并进 into（按 PID 去重，files 取并集）
+void merge_process_results(std::vector<ProcessResult>& into, const std::vector<ProcessResult>& extra);
+
+// 删除路径（进回收站，可撤销）。部分失败时返回 false 并给出原因。
+bool delete_paths(const std::vector<std::wstring>& paths, std::wstring& error, int* error_code = nullptr);
+
+// 安排"重启后删除"（不进回收站；需要管理员权限）
+bool delete_on_reboot(const std::vector<std::wstring>& paths, std::wstring& error);
+

@@ -34,6 +34,8 @@ namespace
         text += L"  --register         添加右键菜单项（仅当前用户）\n";
         text += L"  --unregister       移除右键菜单项\n";
         text += L"  --sendto           加到「发送到」菜单（Win11 一级右键菜单可见）\n";
+        text += L"  --delete           删除这些路径（进回收站；被占用时先解除占用再重试）\n";
+        text += L"  --delete-reboot    安排重启后删除（不进回收站，需要管理员）\n";
         text += L"  --version          显示版本\n";
         text += L"  -h, --help         显示本帮助\n";
         return text;
@@ -195,7 +197,7 @@ namespace
     bool is_cli_flag(const std::wstring& arg)
     {
         return arg == L"--json" || arg == L"--kill" || arg == L"--unlock" || arg == L"--wait" || arg == L"--timeout" ||
-               arg == L"--sendto" ||
+               arg == L"--sendto" || arg == L"--delete" || arg == L"--delete-reboot" ||
                arg == L"--help" || arg == L"-h" || arg == L"--version" || arg == L"--cli" ||
                arg == L"--register" || arg == L"--unregister" || arg == L"--elevate";
     }
@@ -223,6 +225,8 @@ int cli_main(const std::vector<std::wstring>& args)
     bool unlock = false;
     bool wait = false;
     bool elevate = false;
+    bool delete_files = false;
+    bool delete_reboot = false;
     int timeout_ms = -1;
     std::vector<std::wstring> paths;
 
@@ -248,6 +252,14 @@ int cli_main(const std::vector<std::wstring>& args)
         else if (arg == L"--elevate")
         {
             elevate = true;
+        }
+        else if (arg == L"--delete")
+        {
+            delete_files = true;
+        }
+        else if (arg == L"--delete-reboot")
+        {
+            delete_reboot = true;
         }
         else if (arg == L"--timeout")
         {
@@ -408,19 +420,6 @@ int cli_main(const std::vector<std::wstring>& args)
         }
     }
 
-    LocksmithResult locks;
-    try
-    {
-        locks = find_locks(paths);
-    }
-    catch (const std::exception& ex)
-    {
-        app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
-        return 1;
-    }
-
-    std::vector<ProcessResult> results = locks.processes;
-
     // 诊断信息（警告 / 进度 / 结果说明）走 stderr：
     // --json 模式下 stdout 必须只有一行 JSON，脚本才能直接解析。
     auto note = [json_output](const std::wstring& text) {
@@ -433,6 +432,72 @@ int cli_main(const std::vector<std::wstring>& args)
             app::out(text);
         }
     };
+
+    // 快捷方式 / 可执行文件按"这个程序的所有进程（含子进程）"处理，其余按文件占用查
+    std::vector<std::wstring> file_paths;
+    std::vector<std::wstring> app_targets;
+    for (const auto& path : paths)
+    {
+        if (shell_integration::is_shortcut(path))
+        {
+            std::wstring target;
+            std::wstring arguments;
+            if (shell_integration::resolve_shortcut(path, target, arguments))
+            {
+                note(L"快捷方式 " + path + L"\n  → 目标 " + target + L"\n");
+                app_targets.push_back(target);
+            }
+            else
+            {
+                note(L"警告: 解析快捷方式失败，按普通文件处理: " + path + L"\n");
+                file_paths.push_back(path);
+            }
+        }
+        else if (shell_integration::is_executable(path))
+        {
+            app_targets.push_back(path);
+        }
+        else
+        {
+            file_paths.push_back(path);
+        }
+    }
+
+    LocksmithResult locks;
+    if (!file_paths.empty())
+    {
+        try
+        {
+            locks = find_locks(file_paths);
+        }
+        catch (const std::exception& ex)
+        {
+            app::out(L"枚举进程失败: " + app::to_wstring(ex.what()) + L"\n");
+            return 1;
+        }
+    }
+    else
+    {
+        locks.handles_query_ok = true;
+        locks.processes_query_ok = true;
+    }
+
+    // 把快捷方式/可执行文件展开成整棵进程树
+    for (const auto& target : app_targets)
+    {
+        auto extra = find_application_processes(target, /* include_children */ true);
+        if (extra.empty())
+        {
+            note(L"没有找到正在运行的程序: " + target + L"\n");
+        }
+        else
+        {
+            note(L"程序 " + target + L": 找到 " + std::to_wstring(extra.size()) + L" 个进程（含子进程）\n");
+        }
+        merge_process_results(locks.processes, extra);
+    }
+
+    std::vector<ProcessResult> results = locks.processes;
 
     if (!locks.unresolved_paths.empty())
     {
@@ -483,7 +548,69 @@ int cli_main(const std::vector<std::wstring>& args)
                              : L"仍然被 " + std::to_wstring(results.size()) + L" 个进程占用（可用 --kill 结束它们，或用 --elevate 提权后重试）。\n");
     }
 
-    // 2) 仍然占用时，按需结束进程
+    // 2) 删除文件：动作型命令，成功后直接退出（不再打印过期的查询结果）
+    if (delete_files || delete_reboot)
+    {
+        const auto& targets = paths;
+        bool success = false;
+        bool reboot_scheduled = false;
+
+        if (delete_reboot)
+        {
+            std::wstring reboot_error;
+            if (delete_on_reboot(targets, reboot_error))
+            {
+                success = true;
+                reboot_scheduled = true;
+                note(L"已安排重启后删除（重启时生效，不进回收站，无法还原）\n");
+            }
+            else
+            {
+                note(L"安排重启后删除失败: " + reboot_error + L"\n");
+            }
+        }
+        else
+        {
+            std::wstring error;
+            int code = 0;
+            if (delete_paths(targets, error, &code))
+            {
+                success = true;
+            }
+            else
+            {
+                const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
+                if (lock_like && !locks.handles.empty())
+                {
+                    std::vector<std::wstring> failures;
+                    const auto closed = release_handles(locks.handles, failures);
+                    note(L"删除失败（" + error + L"），已强制关闭 " + std::to_wstring(closed) + L" 个句柄，重试…\n");
+                    success = delete_paths(targets, error, &code);
+                }
+
+                if (!success)
+                {
+                    note(L"删除失败: " + error + L"（可试试 --delete-reboot，或 --elevate 提权后重试）\n");
+                }
+            }
+
+            if (success)
+            {
+                note(L"已删除 " + std::to_wstring(targets.size()) + L" 个路径（进回收站，可从回收站还原）\n");
+            }
+        }
+
+        if (json_output)
+        {
+            app::out(L"{\"action\":\"" + std::wstring(delete_reboot ? L"deleteReboot" : L"delete") +
+                     L"\",\"paths\":" + std::to_wstring(targets.size()) +
+                     L",\"scheduledReboot\":" + (reboot_scheduled ? L"true" : L"false") + L"}\n");
+        }
+
+        return success ? 0 : 1;
+    }
+
+    // 3) 仍然占用时，按需结束进程
     if (kill)
     {
         note(kill_processes(results));

@@ -24,6 +24,7 @@ namespace
     constexpr int IDC_PATH_LABEL = 1007;
     constexpr int IDC_STATUS = 1008;
     constexpr int IDC_FORCE_UNLOCK = 1009;
+    constexpr int IDC_DELETE_FILES = 1010;
 
     // 菜单命令（ID 从 2000 起，和控件 ID 分开）
     constexpr int IDM_TOGGLE_CONTEXT_MENU = 2001;
@@ -36,6 +37,7 @@ namespace
     constexpr int IDM_EXIT = 2008;
     constexpr int IDM_ADD_FILES = 2009;
     constexpr int IDM_ADD_FOLDER = 2010;
+    constexpr int IDM_DELETE_FILES = 2011;
 
     // 子控件转发拖放用的 subclass id
     constexpr UINT_PTR DROP_SUBCLASS_ID = 1;
@@ -54,6 +56,7 @@ namespace
         { IDC_KILL_SELECTED, L"结束进程", 110 },
         { IDC_KILL_ALL, L"全部结束", 110 },
         { IDC_FORCE_UNLOCK, L"强制解锁", 110 },
+        { IDC_DELETE_FILES, L"删除文件", 110 },
         { IDC_REFRESH, L"重新检查", 90 },
         { IDC_OPEN_LOCATION, L"打开所在位置", 140 },
         { IDC_ELEVATE, L"以管理员身份重启", 170 },
@@ -82,12 +85,15 @@ namespace
     std::vector<std::wstring> g_paths;
     std::vector<ProcessResult> g_results;
     std::vector<LockedHandle> g_handles;
+    // 拖进来的快捷方式 / exe 解析出的目标程序：查询时展开成"它的所有进程（含子进程）"
+    std::vector<std::wstring> g_app_targets;
     bool g_handles_query_ok = true;
 
     struct SearchPayload
     {
         LocksmithResult locks;
         std::wstring error;
+        std::wstring app_note;   // 快捷方式展开的说明
     };
 
     // Control IDs are passed through the HMENU parameter of CreateWindowExW;
@@ -336,6 +342,7 @@ namespace
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_ADD_FILES, L"添加文件…(&F)\tCtrl+O");
         AppendMenuW(file_menu, MF_STRING, IDM_ADD_FOLDER, L"添加文件夹…(&D)");
+        AppendMenuW(file_menu, MF_STRING, IDM_DELETE_FILES, L"删除检查的文件…(&E)");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"退出(&X)");
 
@@ -504,11 +511,31 @@ namespace
         g_worker_running.store(true);
 
         auto paths = g_paths;
-        std::thread([paths] {
+        auto app_targets = g_app_targets;
+        std::thread([paths, app_targets] {
             auto payload = new SearchPayload();
             try
             {
-                payload->locks = find_locks(paths);
+                if (!paths.empty())
+                {
+                    payload->locks = find_locks(paths);
+                }
+                else
+                {
+                    payload->locks.handles_query_ok = true;
+                    payload->locks.processes_query_ok = true;
+                }
+
+                // 快捷方式 / exe：展开成整棵进程树后并入结果
+                for (const auto& target : app_targets)
+                {
+                    auto extra = find_application_processes(target, /* include_children */ true);
+                    if (!extra.empty())
+                    {
+                        payload->app_note += L"「" + target + L"」展开出 " + std::to_wstring(extra.size()) + L" 个进程；";
+                    }
+                    merge_process_results(payload->locks.processes, extra);
+                }
             }
             catch (const std::exception& ex)
             {
@@ -591,6 +618,114 @@ namespace
         start_search();
     }
 
+    // 删除失败后重新核对哪些还在，并把已删除的从列表里拿掉
+    void finish_delete()
+    {
+        std::vector<std::wstring> remaining;
+        for (const auto& path : g_paths)
+        {
+            if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                remaining.push_back(path);
+            }
+        }
+
+        const size_t deleted = g_paths.size() - remaining.size();
+        g_paths = remaining;
+        if (g_paths.empty())
+        {
+            g_app_targets.clear();
+        }
+
+        if (deleted > 0)
+        {
+            set_status(L"已删除 " + std::to_wstring(deleted) + L" 个路径"
+                       + (remaining.empty() ? L"。" : L"，还有 " + std::to_wstring(remaining.size()) + L" 个没删掉。"));
+        }
+
+        update_path_label();
+        if (g_paths.empty())
+        {
+            g_results.clear();
+            g_handles.clear();
+            fill_list();
+        }
+        else
+        {
+            start_search();
+        }
+    }
+
+    void run_delete(bool already_released_handles)
+    {
+        std::vector<std::wstring> targets = g_paths;
+        std::wstring error;
+        int code = 0;
+
+        if (delete_paths(targets, error, &code))
+        {
+            finish_delete();
+            return;
+        }
+
+        const bool lock_like = code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED || code == 0x78;
+        if (!already_released_handles && lock_like && !g_handles.empty())
+        {
+            std::vector<std::wstring> failures;
+            const auto closed = release_handles(g_handles, failures);
+            set_status(L"删除失败（" + error + L"），已强制关闭 " + std::to_wstring(closed) + L" 个句柄，正在重试…");
+            run_delete(true);
+            return;
+        }
+
+        std::wstring question = L"删除失败：" + error + L"\n\n要不要安排「重启后删除」？\n\n"
+                                L"• 会写进系统的 PendingFileRenameOperations，重启后自动删除\n"
+                                L"• 不进回收站（无法还原）\n"
+                                L"• 需要管理员权限";
+        if (MessageBoxW(g_window, question.c_str(), L"重启后删除", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        {
+            set_status(L"删除已取消：" + error);
+            return;
+        }
+
+        std::wstring reboot_error;
+        if (delete_on_reboot(targets, reboot_error))
+        {
+            set_status(L"已安排重启后删除（重启时生效）");
+            finish_delete();
+        }
+        else
+        {
+            set_status(L"安排重启后删除失败：" + reboot_error);
+        }
+    }
+
+    void delete_checked_paths()
+    {
+        if (g_paths.empty())
+        {
+            set_status(L"没有要删除的路径。");
+            return;
+        }
+
+        std::wstring list;
+        for (const auto& path : g_paths)
+        {
+            list += L"  " + path + L"\n";
+        }
+
+        std::wstring question = L"确定要删除下面 " + std::to_wstring(g_paths.size()) + L" 个路径吗？\n\n" + list +
+                                L"\n• 会放进回收站（可以还原）\n"
+                                L"• 如果被占用，会先尝试强制解除占用再删除\n"
+                                L"• 仍然失败时会询问你要不要安排「重启后删除」";
+        if (MessageBoxW(g_window, question.c_str(), L"删除文件", MB_YESNO | MB_ICONWARNING) != IDYES)
+        {
+            return;
+        }
+
+        run_delete(false);
+    }
+
     void force_unlock()
     {
         if (g_handles.empty())
@@ -650,15 +785,44 @@ namespace
         PostMessageW(g_window, WM_CLOSE, 0, 0);
     }
 
+    void add_app_target(const std::wstring& target)
+    {
+        if (!target.empty() && std::find(g_app_targets.begin(), g_app_targets.end(), target) == g_app_targets.end())
+        {
+            g_app_targets.push_back(target);
+        }
+    }
+
     void add_paths(const std::vector<std::wstring>& new_paths)
     {
         bool changed = false;
         for (const auto& path : new_paths)
         {
-            if (std::find(g_paths.begin(), g_paths.end(), path) == g_paths.end())
+            if (std::find(g_paths.begin(), g_paths.end(), path) != g_paths.end())
             {
-                g_paths.push_back(path);
-                changed = true;
+                continue;
+            }
+
+            g_paths.push_back(path);
+            changed = true;
+
+            // 快捷方式：解析出目标程序，按"这个程序的所有进程"处理
+            if (shell_integration::is_shortcut(path))
+            {
+                std::wstring target;
+                std::wstring arguments;
+                if (shell_integration::resolve_shortcut(path, target, arguments))
+                {
+                    add_app_target(target);
+                }
+                else
+                {
+                    set_status(L"解析快捷方式失败，按普通文件处理: " + path);
+                }
+            }
+            else if (shell_integration::is_executable(path))
+            {
+                add_app_target(path);
             }
         }
 
@@ -800,6 +964,7 @@ namespace
             case IDC_KILL_SELECTED: kill_selected(); return 0;
             case IDC_KILL_ALL: kill_all(); return 0;
             case IDC_FORCE_UNLOCK: force_unlock(); return 0;
+            case IDC_DELETE_FILES: delete_checked_paths(); return 0;
             case IDC_REFRESH: start_search(); return 0;
             case IDC_OPEN_LOCATION: open_file_location(); return 0;
             case IDC_ELEVATE: restart_elevated(); return 0;
@@ -814,6 +979,7 @@ namespace
                 return 0;
             case IDM_ADD_FILES: add_files_via_dialog(); return 0;
             case IDM_ADD_FOLDER: add_folder_via_dialog(); return 0;
+            case IDM_DELETE_FILES: delete_checked_paths(); return 0;
             case IDM_REFRESH: start_search(); return 0;
             case IDM_ELEVATE: restart_elevated(); return 0;
             case IDM_ABOUT: show_about(); return 0;
@@ -937,6 +1103,10 @@ namespace
                 {
                     std::wstring text = L"找到 " + std::to_wstring(g_results.size()) + L" 个进程正在占用" +
                                         L"（可强制关闭的文件句柄 " + std::to_wstring(g_handles.size()) + L" 个）";
+                    if (!payload->app_note.empty())
+                    {
+                        text += L"；" + payload->app_note;
+                    }
                     if (unresolved > 0)
                     {
                         text += L"；另有 " + std::to_wstring(unresolved) + L" 个路径打不开，已跳过";

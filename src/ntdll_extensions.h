@@ -25,8 +25,11 @@ public:
     struct ProcessInfo
     {
         DWORD pid = 0;
+        DWORD parent_pid = 0;
         std::wstring name;
         std::wstring user;
+        // 主模块（exe）完整路径：用来判断"这个进程是不是由某个 exe 启动的"
+        std::wstring image_path;
         std::vector<std::wstring> modules;
     };
 
@@ -53,4 +56,5 @@ public:
     // Returns the list of all processes.
     // On failure, returns an empty vector and sets *ok to false.
     std::vector<ProcessInfo> processes(bool* ok = nullptr) noexcept;
+    std::vector<ProcessInfo> processes_ex(bool* ok, bool include_modules) noexcept;
 };

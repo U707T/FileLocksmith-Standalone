@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0 (2026-10-10)
+
+### 新增
+- **拖动应用快捷方式 = 管住这个程序的所有进程**：拖一个 `.lnk` 进来会解析出目标程序，
+  再按镜像路径匹配 + 沿父进程关系展开**整棵进程树**（主进程、子进程、孙进程），
+  `全部结束` / `--kill` 一次收干净 —— 对付 Chrome、VS Code 这类"一个主进程带一堆子进程"的程序。
+  直接拖 `.exe` 等价。命令行同样支持：`FileLocksmith.exe app.lnk --kill`。
+- **删除文件**（界面上新增 `删除文件` 按钮、菜单「文件 → 删除检查的文件…」、命令行 `--delete`）：
+  1. 先直接删，**进回收站**（可还原）；
+  2. 失败且是"被占用"→ 自动强制关闭占用句柄后重试（不结束进程）；
+  3. 仍失败 → 询问是否安排**「重启后删除」**（`MoveFileEx` + `PendingFileRenameOperations`，
+     不进回收站，需要管理员）。
+  界面上有明确的二次确认对话框，列清楚要删哪些路径。
+- `--delete-reboot`：命令行直接安排重启后删除。
+- `--delete --json` 输出 `{"action":"delete","paths":N,"scheduledReboot":false}`，方便脚本判定。
+
+### 审计（本轮新增代码）
+- 删掉无人调用的 `pid_to_full_path()`（死代码）；镜像路径改用
+  `QueryFullProcessImageNameW`（只需 `PROCESS_QUERY_LIMITED_INFORMATION`，比原来
+  `OpenProcess(VM_READ)` + `GetModuleFileNameExW` 便宜）；
+- 同一个进程只 `OpenProcess` 一次，同时拿主模块路径与模块列表（`process_details`）；
+- `delete_paths()` 用 `SHFileOperation(FOF_ALLOWUNDO)` 而不是 `DeleteFile`：能进回收站、
+  能删目录，并且把 Win32/DE_* 错误码翻译成人话。
+
 ## 1.2.2 (2026-10-10)
 
 ### 新增

@@ -20,4 +20,9 @@ namespace shell_integration
 
     // 供界面展示
     std::wstring context_menu_command();
+
+    // .lnk 解析：拿到快捷方式指向的目标（通常是 exe）与参数
+    bool resolve_shortcut(const std::wstring& link_path, std::wstring& target, std::wstring& arguments);
+    bool is_shortcut(const std::wstring& path);     // 扩展名是不是 .lnk
+    bool is_executable(const std::wstring& path);   // 扩展名是不是 .exe / .com / .bat / .cmd
 }

@@ -3,6 +3,8 @@
 #include "file_locksmith.h"
 #include "ntdll_extensions.h"
 
+#include <shellapi.h>
+
 static bool is_directory(const std::wstring path)
 {
     DWORD attributes = GetFileAttributesW(path.c_str());
@@ -219,18 +221,165 @@ size_t release_handles(const std::vector<LockedHandle>& handles, std::vector<std
     return closed;
 }
 
-constexpr size_t LongMaxPathSize = 65536;
-
-std::wstring pid_to_full_path(DWORD pid)
+std::vector<ProcessResult> find_application_processes(const std::wstring& executable, bool include_children)
 {
-    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    std::vector<ProcessResult> result;
 
-    std::wstring result(LongMaxPathSize, L'\0');
+    NtdllExtensions nt_ext;
+    bool ok = false;
+    auto processes = nt_ext.processes_ex(&ok, /* include_modules */ false);
+    if (!ok)
+    {
+        return result;
+    }
 
-    // Returns zero on failure, so it's okay to resize to zero.
-    auto length = GetModuleFileNameExW(process, NULL, result.data(), static_cast<DWORD>(result.size()));
-    result.resize(length);
+    auto same_path = [](const std::wstring& left, const std::wstring& right) {
+        return !left.empty() && _wcsicmp(left.c_str(), right.c_str()) == 0;
+    };
 
-    CloseHandle(process);
+    std::set<DWORD> pids;
+    for (const auto& process : processes)
+    {
+        if (same_path(process.image_path, executable))
+        {
+            pids.insert(process.pid);
+        }
+    }
+
+    if (include_children && !pids.empty())
+    {
+        // 反复扫直到不再增长（进程树通常只有两三层，O(n^2) 在几百个进程规模下无所谓）
+        bool grew = true;
+        while (grew)
+        {
+            grew = false;
+            for (const auto& process : processes)
+            {
+                if (pids.count(process.parent_pid) != 0 && pids.count(process.pid) == 0)
+                {
+                    pids.insert(process.pid);
+                    grew = true;
+                }
+            }
+        }
+    }
+
+    for (const auto& process : processes)
+    {
+        if (pids.count(process.pid) != 0)
+        {
+            result.push_back(ProcessResult{ process.name, process.pid, process.user, { process.image_path } });
+        }
+    }
+
     return result;
+}
+
+void merge_process_results(std::vector<ProcessResult>& into, const std::vector<ProcessResult>& extra)
+{
+    for (const auto& item : extra)
+    {
+        auto it = std::find_if(into.begin(), into.end(), [&](const ProcessResult& existing) { return existing.pid == item.pid; });
+        if (it == into.end())
+        {
+            into.push_back(item);
+            continue;
+        }
+
+        for (const auto& file : item.files)
+        {
+            if (std::find(it->files.begin(), it->files.end(), file) == it->files.end())
+            {
+                it->files.push_back(file);
+            }
+        }
+    }
+}
+
+namespace
+{
+    std::wstring describe_shell_error(int code)
+    {
+        switch (code)
+        {
+        case 0: return {};
+        case ERROR_FILE_NOT_FOUND: return L"文件不存在";
+        case ERROR_PATH_NOT_FOUND: return L"路径不存在";
+        case ERROR_ACCESS_DENIED: return L"拒绝访问（权限不足或被只读属性挡住）";
+        case ERROR_SHARING_VIOLATION: return L"文件正被占用";
+        case ERROR_DIR_NOT_EMPTY: return L"目录不是空的";
+        case ERROR_DISK_FULL: return L"磁盘空间不足";
+        case 0x75: return L"操作被取消";               // DE_OPCANCELLED
+        case 0x78: return L"拒绝访问";                 // DE_ACCESSDENIEDSRC
+        case 0x7C: return L"文件或路径无效";            // DE_INVALIDFILES
+        case 0x7E: return L"目标位置被一个同名文件挡住";  // DE_FLDDESTISFILE
+        case 0x81: return L"文件名太长";                // DE_FILENAMETOOLONG
+        default: break;
+        }
+
+        wchar_t buffer[128];
+        swprintf(buffer, 128, L"错误码 %d (0x%X)", code, code);
+        return buffer;
+    }
+}
+
+bool delete_paths(const std::vector<std::wstring>& paths, std::wstring& error, int* error_code)
+{
+    if (error_code != nullptr)
+    {
+        *error_code = 0;
+    }
+
+    if (paths.empty())
+    {
+        return true;
+    }
+
+    // SHFileOperation 要求路径列表以双 \0 结尾
+    std::vector<wchar_t> list;
+    for (const auto& path : paths)
+    {
+        list.insert(list.end(), path.begin(), path.end());
+        list.push_back(L'\0');
+    }
+    list.push_back(L'\0');
+
+    SHFILEOPSTRUCTW operation{};
+    operation.wFunc = FO_DELETE;
+    operation.pFrom = list.data();
+    // FOF_ALLOWUNDO：进回收站（可撤销）；其余标志位是"别弹系统 UI，我们自己确认过"
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+
+    const int status = SHFileOperationW(&operation);
+    if (status == 0 && !operation.fAnyOperationsAborted)
+    {
+        return true;
+    }
+
+    if (error_code != nullptr)
+    {
+        *error_code = status;
+    }
+    error = operation.fAnyOperationsAborted ? L"操作被取消" : describe_shell_error(status);
+    return false;
+}
+
+bool delete_on_reboot(const std::vector<std::wstring>& paths, std::wstring& error)
+{
+    for (const auto& path : paths)
+    {
+        // MOVEFILE_DELAY_UNTIL_REBOOT 会把删除操作写进 PendingFileRenameOperations，
+        // 需要管理员权限；而且不进回收站。
+        if (!MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
+        {
+            const auto code = GetLastError();
+            error = describe_shell_error(static_cast<int>(code));
+            if (code == ERROR_ACCESS_DENIED)
+            {
+                error += L"（“重启后删除”需要管理员权限）";
+            }
+            return false;
+        }
+    }
+    return true;
 }

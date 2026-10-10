@@ -161,6 +161,62 @@ Write-Host "  stdout: $($r9.StdOut.Trim())"
 if ($r9.StdOut -match '"pid"') { Write-Bad "文件已经没人占用了，却还报告占用" }
 else { Write-Ok "正确地报告没有占用" }
 
+# --- 用例 9：拖动应用快捷方式 → 展开成整棵进程树 → 全部结束 ---
+Write-Case "用例 9 / 快捷方式展开成进程树并全部结束"
+$appDir = Join-Path $env:TEMP 'fl-app-test'
+New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+$appExe = Join-Path $appDir 'fl-app.exe'
+$childExe = Join-Path $appDir 'fl-child.exe'
+Copy-Item "$env:SystemRoot\System32\cmd.exe" $appExe -Force
+Copy-Item "$env:SystemRoot\System32\ping.exe" $childExe -Force
+Set-Content -Path (Join-Path $appDir 'run.bat') -Value "`"$childExe`" -n 300 127.0.0.1" -Encoding ASCII
+
+$link = Join-Path $appDir 'fl-app.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($link)
+$shortcut.TargetPath = $appExe
+$shortcut.Save()
+
+$root = Start-Process -FilePath $appExe -ArgumentList @('/c', (Join-Path $appDir 'run.bat')) -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 5
+$child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($root.Id)" -ErrorAction SilentlyContinue | Select-Object -First 1
+Write-Host "  快捷方式: $link -> $appExe"
+Write-Host "  根进程 $($root.Id)，子进程 $($child.ProcessId)"
+if (-not $child) {
+    Write-Bad "没能造出父子进程对（用例环境问题）"
+} else {
+    $rApp = Invoke-FL @($link, '--json', '--cli')
+    Write-Host "  stdout: $($rApp.StdOut.Trim())"
+    if ($rApp.StdOut -notmatch "`"pid`":\s*$($root.Id)\b") { Write-Bad "没报出根进程 $($root.Id)" }
+    elseif ($rApp.StdOut -notmatch "`"pid`":\s*$($child.ProcessId)\b") { Write-Bad "没展开出子进程 $($child.ProcessId)" }
+    else {
+        $rAppKill = Invoke-FL @($link, '--kill', '--cli')
+        Start-Sleep -Seconds 3
+        $rootAlive = $null -ne (Get-Process -Id $root.Id -ErrorAction SilentlyContinue)
+        $childAlive = $null -ne (Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue)
+        if ($rootAlive -or $childAlive) { Write-Bad "进程树没被全部结束（root=$rootAlive child=$childAlive）" }
+        else { Write-Ok "快捷方式展开出父子进程，并全部结束" }
+    }
+}
+Stop-Process -Id $root.Id, $child.ProcessId -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- 用例 10：删除被占用的文件（先关句柄，不结束进程）---
+Write-Case "用例 10 / 删除被占用的文件（--delete）"
+$victim = Join-Path $dir 'to-delete.txt'
+Set-Content -Path $victim -Value 'bye'
+$locker4 = Start-Locker $victim
+Start-Sleep -Seconds 5
+$rDel = Invoke-FL @($victim, '--delete', '--cli')
+Write-Host "  stdout: $($rDel.StdOut.Trim())"
+$stillThere = Test-Path -LiteralPath $victim
+$lockerAlive = -not $locker4.HasExited
+Stop-Process -Id $locker4.Id -Force -ErrorAction SilentlyContinue
+if ($rDel.ExitCode -ne 0) { Write-Bad "退出码 $($rDel.ExitCode)" }
+elseif ($stillThere) { Write-Bad "被占用的文件没删掉" }
+elseif (-not $lockerAlive) { Write-Bad "占用进程被杀了，--delete 只应该关句柄" }
+else { Write-Ok "被占用的文件已删除（进回收站），占用进程仍在运行" }
+
 # --- 汇总 ---
 Write-Host "`n================ 结果 ================" -ForegroundColor Cyan
 Write-Host "通过 $script:Passed 项，失败 $script:Failed 项"
