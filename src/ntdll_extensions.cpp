@@ -2,6 +2,25 @@
 // Portions derived from Microsoft PowerToys (MIT License, (c) Microsoft Corporation).
 #include "ntdll_extensions.h"
 
+// 公开头文件里的 SYSTEM_PROCESS_INFORMATION 并不完整：MSVC SDK 的 winternl.h 连
+// InheritedFromUniqueProcessId 都没有（MinGW 的反而有）。这里按内核真实布局自己定义一份，
+// 只用到前几个字段，两个工具链行为一致。8 字节对齐与内核一致。
+#pragma pack(push, 8)
+struct FL_SYSTEM_PROCESS_INFORMATION
+{
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER Reserved[3];  // 覆盖 Win7/8 陆续加进来的 WorkingSetPrivateSize / HardFaultCount / CycleTime
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+};
+#pragma pack(pop)
+
 namespace
 {
     std::wstring unicode_to_str(UNICODE_STRING unicode_str)
