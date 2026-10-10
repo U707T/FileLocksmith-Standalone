@@ -171,8 +171,9 @@ namespace gui::detail
                     set_status(L"打不开「发送到」文件夹。");
                 }
                 return 0;
-            case IDM_ADD_FILES: add_files_via_dialog(); return 0;
-            case IDM_ADD_FOLDER: add_folder_via_dialog(); return 0;
+            case IDM_ADD_FILES: add_files_via_dialog(true); return 0;
+            case IDM_ADD_FOLDER: add_folder_via_dialog(true); return 0;
+            case IDM_APPEND_FILES: add_files_via_dialog(false); return 0;
             case IDM_DELETE_FILES: delete_checked_paths(); return 0;
             case IDM_REFRESH: start_search(); return 0;
             case IDM_ELEVATE: restart_elevated(); return 0;
@@ -201,7 +202,7 @@ namespace gui::detail
                 }
             }
             DragFinish(drop);
-            add_paths(dropped);
+            add_paths(dropped, /* replace */ true);
             return 0;
         }
 
@@ -234,7 +235,7 @@ namespace gui::detail
             }
 
             SetForegroundWindow(ui().window);
-            add_paths(incoming);
+            add_paths(incoming, /* replace */ true);
             return TRUE;
         }
 
@@ -315,8 +316,27 @@ namespace gui::detail
 
         case WM_FL_SEARCH_DONE:
         {
-            KillTimer(ui().window, BUSY_TIMER_ID);
             std::unique_ptr<SearchPayload> payload(reinterpret_cast<SearchPayload*>(l_param));
+
+            // 用户在这轮扫描跑完之前又拖了新文件：这次结果已经过期，直接丢掉，
+            // 不能让它盖掉新一轮的结果（否则界面会先显示旧文件的内容）
+            if (payload->generation != ui().search_generation)
+            {
+                if (ui().search_pending)
+                {
+                    ui().search_pending = false;
+                    start_search();
+                }
+                else if (!ui().searching)
+                {
+                    // 兜底：没有排队的新扫描就收尾，别让界面永远停在"正在扫描…"
+                    KillTimer(ui().window, BUSY_TIMER_ID);
+                    set_busy(false);
+                }
+                return 0;
+            }
+
+            KillTimer(ui().window, BUSY_TIMER_ID);
             set_busy(false);
 
             if (!payload->error.empty())
@@ -501,6 +521,7 @@ namespace gui
             { FVIRTKEY, VK_F5, IDM_REFRESH },
             { FVIRTKEY, VK_DELETE, IDM_LIST_KILL },
             { FVIRTKEY | FCONTROL, 'O', IDM_ADD_FILES },
+            { FVIRTKEY | FCONTROL | FSHIFT, 'O', IDM_APPEND_FILES },
             { FVIRTKEY | FCONTROL, 'C', IDM_LIST_COPY_ROW },
             { FVIRTKEY | FCONTROL, 'A', IDM_LIST_SELECT_ALL },
         };

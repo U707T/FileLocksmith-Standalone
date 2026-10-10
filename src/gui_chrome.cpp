@@ -276,8 +276,9 @@ namespace gui::detail
         AppendMenuW(file_menu, MF_STRING, IDM_INSTALL_SENDTO, L"添加到「发送到」菜单(&S)");
         AppendMenuW(file_menu, MF_STRING, IDM_OPEN_SENDTO, L"打开「发送到」文件夹(&O)");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FILES, L"添加文件…(&F)\tCtrl+O");
-        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FOLDER, L"添加文件夹…(&D)");
+        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FILES, L"检查文件…(&F)\tCtrl+O");
+        AppendMenuW(file_menu, MF_STRING, IDM_ADD_FOLDER, L"检查文件夹…(&D)");
+        AppendMenuW(file_menu, MF_STRING, IDM_APPEND_FILES, L"追加文件到当前检查…(&A)\tCtrl+Shift+O");
         AppendMenuW(file_menu, MF_STRING, IDM_DELETE_FILES, L"删除检查的文件…(&E)");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IDM_EXIT, L"退出(&X)");

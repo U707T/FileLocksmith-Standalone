@@ -42,6 +42,7 @@ namespace gui::detail
     constexpr int IDM_HOMEPAGE = 2007;
     constexpr int IDM_EXIT = 2008;
     constexpr int IDM_ADD_FILES = 2009;
+    constexpr int IDM_APPEND_FILES = 2012;
     constexpr int IDM_ADD_FOLDER = 2010;
     constexpr int IDM_LIST_KILL = 2100;
     constexpr int IDM_LIST_LOCATE = 2101;
@@ -85,9 +86,12 @@ namespace gui::detail
         LocksmithResult locks;
         std::wstring error;
         std::wstring app_note;   // 快捷方式展开的说明
+        unsigned generation = 0; // 发起这次扫描时的代号
     };
     constexpr UINT kDpiChangedMessage = 0x02E0;
-    void add_paths(const std::vector<std::wstring>& new_paths);
+    // replace=true（拖放/打开方式的默认语义）：这是新的一次检查，先清空上一次的路径与结果
+    void add_paths(const std::vector<std::wstring>& new_paths, bool replace);
+    void clear_current_check();
 
     // 界面状态（原来散在匿名命名空间里的全局变量）
     struct UiState
@@ -107,6 +111,8 @@ namespace gui::detail
         DWORD busy_started = 0;
         bool searching = false;
         bool search_pending = false;
+        // 每次重新检查自增：旧扫描的结果回来时用它判断是否已经过期（用户又拖了新文件）
+        unsigned search_generation = 0;
         std::atomic<bool> worker_running { false };
         std::atomic<HWND> post_target { nullptr };
         std::vector<std::wstring> paths;
@@ -124,8 +130,8 @@ namespace gui::detail
 
     // ---- 各文件里的函数（模块内部使用）----
     void add_app_target(const std::wstring& target);
-    void add_files_via_dialog();
-    void add_folder_via_dialog();
+    void add_files_via_dialog(bool replace);
+    void add_folder_via_dialog(bool replace);
     void add_paths(const std::vector<std::wstring>& new_paths);
     void add_sendto_menu();
     void apply_ui_font();

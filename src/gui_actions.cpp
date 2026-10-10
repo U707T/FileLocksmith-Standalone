@@ -497,21 +497,21 @@ namespace gui::detail
         return ok;
     }
 
-    void add_files_via_dialog()
+    void add_files_via_dialog(bool replace)
     {
         std::vector<std::wstring> chosen;
         if (pick_files(chosen))
         {
-            add_paths(chosen);
+            add_paths(chosen, replace);
         }
     }
 
-    void add_folder_via_dialog()
+    void add_folder_via_dialog(bool replace)
     {
         std::wstring chosen;
         if (pick_folder(chosen))
         {
-            add_paths({ chosen });
+            add_paths({ chosen }, replace);
         }
     }
 

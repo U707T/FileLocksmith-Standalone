@@ -79,10 +79,13 @@ namespace gui::detail
         SetTimer(ui().window, BUSY_TIMER_ID, 500, nullptr);
         ui().worker_running.store(true);
 
+        const unsigned generation = ++ui().search_generation;
+
         auto paths = ui().paths;
         auto app_targets = ui().app_targets;
-        std::thread([paths, app_targets] {
+        std::thread([paths, app_targets, generation] {
             auto payload = new SearchPayload();
+            payload->generation = generation;
             try
             {
                 if (!paths.empty())
@@ -125,9 +128,17 @@ namespace gui::detail
         }).detach();
     }
 
-    void add_paths(const std::vector<std::wstring>& new_paths)
+    void add_paths(const std::vector<std::wstring>& new_paths, bool replace)
     {
-        bool changed = false;
+        // 有任何新输入就把上一轮的代号作废：正在跑的那次扫描结果回来时会被丢掉
+        ++ui().search_generation;
+
+        if (replace)
+        {
+            // 只是想看新的东西：先把上一次的记录清掉，不要累加
+            clear_current_check();
+        }
+
         for (const auto& path : new_paths)
         {
             if (std::find(ui().paths.begin(), ui().paths.end(), path) != ui().paths.end())
@@ -136,7 +147,6 @@ namespace gui::detail
             }
 
             ui().paths.push_back(path);
-            changed = true;
 
             // 快捷方式：解析出目标程序，按"这个程序的所有进程"处理
             if (shell_integration::is_shortcut(path))
@@ -158,11 +168,24 @@ namespace gui::detail
             }
         }
 
-        if (changed)
+        update_path_label();
+        start_search();
+    }
+
+    // 清空上一次的检查（路径、结果、句柄、列表）
+    void clear_current_check()
+    {
+        ui().paths.clear();
+        ui().app_targets.clear();
+        ui().results.clear();
+        ui().handles.clear();
+        ui().handles_query_ok = true;
+        ui().search_pending = false;   // 排队中的旧扫描没意义了
+        if (ui().list != nullptr)
         {
-            update_path_label();
-            start_search();
+            ListView_DeleteAllItems(ui().list);
         }
+        update_button_states();
     }
 
     void add_app_target(const std::wstring& target)
