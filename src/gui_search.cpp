@@ -2,6 +2,58 @@
 
 namespace gui::detail
 {
+    namespace
+    {
+        void resolve_app_target_for_path(const std::wstring& path);
+
+        bool append_path_to_model(const std::wstring& path)
+        {
+            if (path.empty() || std::find(ui().paths.begin(), ui().paths.end(), path) != ui().paths.end())
+            {
+                return false;
+            }
+
+            ui().paths.push_back(path);
+            resolve_app_target_for_path(path);
+            return true;
+        }
+
+        void invalidate_result_model()
+        {
+            ui().results.clear();
+            ui().handles.clear();
+            ui().handles_query_ok = false;
+            ui().processes_query_ok = false;
+            ui().result_valid = false;
+            if (ui().list != nullptr)
+            {
+                ListView_DeleteAllItems(ui().list);
+            }
+        }
+
+        void resolve_app_target_for_path(const std::wstring& path)
+        {
+            // 快捷方式：解析出目标程序，按"这个程序的所有进程"处理。
+            if (shell_integration::is_shortcut(path))
+            {
+                std::wstring target;
+                std::wstring arguments;
+                if (shell_integration::resolve_shortcut(path, target, arguments))
+                {
+                    add_app_target(target);
+                }
+                else if (ui().status != nullptr)
+                {
+                    set_status(L"解析快捷方式失败，按普通文件处理: " + path);
+                }
+            }
+            else if (shell_integration::is_executable(path))
+            {
+                add_app_target(path);
+            }
+        }
+    }
+
     void set_busy(bool busy)
     {
         ui().searching = busy;
@@ -10,6 +62,42 @@ namespace gui::detail
             set_status(L"正在扫描系统句柄…");
         }
         update_button_states();
+        update_menu_state();
+    }
+
+    bool is_search_busy()
+    {
+        return ui().searching || ui().worker_running.load();
+    }
+
+    bool ensure_result_action(const wchar_t* action)
+    {
+        if (is_search_busy())
+        {
+            set_status(std::wstring(action) + L"：请等待当前扫描完成。");
+            return false;
+        }
+        if (!ui().result_valid || !ui().handles_query_ok || !ui().processes_query_ok)
+        {
+            set_status(std::wstring(action) + L"：当前结果不可用，请重新检查。");
+            return false;
+        }
+        return true;
+    }
+
+    bool ensure_path_action(const wchar_t* action)
+    {
+        if (is_search_busy())
+        {
+            set_status(std::wstring(action) + L"：请等待当前扫描完成。");
+            return false;
+        }
+        if (ui().paths.empty())
+        {
+            set_status(std::wstring(action) + L"：没有要处理的路径。");
+            return false;
+        }
+        return true;
     }
 
     void fill_list()
@@ -18,6 +106,11 @@ namespace gui::detail
         for (const auto& handle : ui().handles)
         {
             ++handle_counts[handle.pid];
+        }
+
+        if (ui().list == nullptr)
+        {
+            return;
         }
 
         SendMessageW(ui().list, WM_SETREDRAW, FALSE, 0);
@@ -60,10 +153,13 @@ namespace gui::detail
 
     void start_search()
     {
-        // 判断"是否还有扫描在跑"必须用 worker 自己维护的原子标志：
-        // 手动维护的 searching 只要漏一次复位，就会永远卡在"正在扫描…"
-        // （2.0.1 的拖放死锁就是：过期结果那条分支没有把 searching 复位，
-        //   于是 start_search 一直被判定为"正在查"，新扫描永远起不来）
+        if (ui().closing)
+        {
+            return;
+        }
+
+        // 只允许一个任务处于"等待主线程消费完成消息"的状态。新的输入先排队，
+        // 这样旧任务不会和新任务同时运行，也不会用旧完成消息清掉新任务的 busy 状态。
         if (ui().worker_running.load())
         {
             ui().search_pending = true;
@@ -75,106 +171,147 @@ namespace gui::detail
             return;
         }
 
+        ui().search_pending = false;
+        invalidate_result_model();
         ui().searching = true;
         set_busy(true);
         InvalidateRect(ui().list, nullptr, TRUE);   // 空态提示画在列表 WM_PAINT 里，扫描开始时刷掉
         ui().busy_started = GetTickCount();
         SetTimer(ui().window, BUSY_TIMER_ID, 500, nullptr);
-        ui().worker_running.store(true);
 
-        const unsigned generation = ++ui().search_generation;
+        const uint64_t input_generation = ui().input_generation;
+        const uint64_t job_id = ++ui().next_job_id;
+        ui().active_job_id = job_id;
+        ui().worker_running.store(true);
 
         auto paths = ui().paths;
         auto app_targets = ui().app_targets;
-        std::thread([paths, app_targets, generation] {
-            auto payload = new SearchPayload();
-            payload->generation = generation;
-            try
-            {
-                if (!paths.empty())
+        try
+        {
+            ui().worker = std::thread([paths, app_targets, input_generation, job_id] {
+                auto payload = new SearchPayload();
+                payload->job_id = job_id;
+                payload->input_generation = input_generation;
+                try
                 {
-                    payload->locks = find_locks(paths);
-                }
-                else
-                {
-                    payload->locks.handles_query_ok = true;
-                    payload->locks.processes_query_ok = true;
-                }
-
-                // 快捷方式 / exe：展开成整棵进程树后并入结果
-                for (const auto& target : app_targets)
-                {
-                    auto extra = find_application_processes(target, /* include_children */ true);
-                    if (!extra.empty())
+                    if (!paths.empty())
                     {
-                        payload->app_note += L"「" + target + L"」展开出 " + std::to_wstring(extra.size()) + L" 个进程；";
+                        payload->locks = find_locks(paths);
                     }
-                    merge_process_results(payload->locks.processes, extra);
+                    else
+                    {
+                        payload->locks.handles_query_ok = true;
+                        payload->locks.processes_query_ok = true;
+                    }
+
+                    // 快捷方式 / exe：展开成整棵进程树后并入结果
+                    for (const auto& target : app_targets)
+                    {
+                        auto extra = find_application_processes(target, /* include_children */ true);
+                        if (!extra.empty())
+                        {
+                            payload->app_note += L"「" + target + L"」展开出 " + std::to_wstring(extra.size()) + L" 个进程；";
+                        }
+                        merge_process_results(payload->locks.processes, extra);
+                    }
                 }
-            }
-            catch (const std::exception& ex)
-            {
-                payload->error = L"枚举失败: " + app::to_wstring(ex.what());
-            }
-            catch (...)
-            {
-                payload->error = L"枚举失败: 未知错误";
-            }
+                catch (const std::exception& ex)
+                {
+                    payload->error = L"枚举失败: " + app::to_wstring(ex.what());
+                }
+                catch (...)
+                {
+                    payload->error = L"枚举失败: 未知错误";
+                }
 
-            // 先复位再投递：主线程收到结果时就能立刻启动下一轮扫描
-            ui().worker_running.store(false);
+                // worker_running 要等主线程消费完成消息后才复位，避免新的 worker 与旧 payload 同时在途。
+                HWND target = ui().post_target.load();
+                if (target != nullptr && !ui().closing &&
+                    PostMessageW(target, WM_FL_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload)) != 0)
+                {
+                    return;
+                }
 
-            HWND target = ui().post_target.load();
-            const bool posted = target != nullptr && PostMessageW(target, WM_FL_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload)) != 0;
-            if (!posted)
-            {
+                if (target != nullptr && !ui().closing)
+                {
+                    // 极少数情况下消息队列投递失败：交给 busy timer 兜底消费，避免界面
+                    // 永远停在"正在扫描"。关闭窗口时则不再把结果交回 UI。
+                    SearchPayload* expected = nullptr;
+                    if (!ui().completion_fallback.compare_exchange_strong(expected, payload))
+                    {
+                        delete payload;
+                    }
+                    return;
+                }
+
                 delete payload;
-            }
-        }).detach();
+                ui().worker_running.store(false);
+            });
+        }
+        catch (...)
+        {
+            ui().worker_running.store(false);
+            KillTimer(ui().window, BUSY_TIMER_ID);
+            ui().searching = false;
+            set_status(L"无法启动后台扫描线程。");
+            update_button_states();
+            update_menu_state();
+        }
     }
 
     void add_paths(const std::vector<std::wstring>& new_paths, bool replace)
     {
-        // 有任何新输入就把上一轮的代号作废：正在跑的那次扫描结果回来时会被丢掉
-        ++ui().search_generation;
+        if (new_paths.empty())
+        {
+            return;
+        }
 
         if (replace)
         {
+            ++ui().input_generation;
             // 只是想看新的东西：先把上一次的记录清掉，不要累加
             clear_current_check();
         }
 
+        bool changed = false;
         for (const auto& path : new_paths)
         {
-            if (std::find(ui().paths.begin(), ui().paths.end(), path) != ui().paths.end())
-            {
-                continue;
-            }
+            changed = append_path_to_model(path) || changed;
+        }
 
-            ui().paths.push_back(path);
+        if (!replace && changed)
+        {
+            ++ui().input_generation;
+        }
 
-            // 快捷方式：解析出目标程序，按"这个程序的所有进程"处理
-            if (shell_integration::is_shortcut(path))
-            {
-                std::wstring target;
-                std::wstring arguments;
-                if (shell_integration::resolve_shortcut(path, target, arguments))
-                {
-                    add_app_target(target);
-                }
-                else
-                {
-                    set_status(L"解析快捷方式失败，按普通文件处理: " + path);
-                }
-            }
-            else if (shell_integration::is_executable(path))
-            {
-                add_app_target(path);
-            }
+        if (!changed)
+        {
+            update_header();
+            return;
         }
 
         update_header();
         start_search();
+    }
+
+    void initialize_paths(const std::vector<std::wstring>& paths)
+    {
+        ui().paths.clear();
+        ui().app_targets.clear();
+        ++ui().input_generation;
+        for (const auto& path : paths)
+        {
+            append_path_to_model(path);
+        }
+    }
+
+    void rebuild_app_targets()
+    {
+        ui().app_targets.clear();
+        for (const auto& path : ui().paths)
+        {
+            resolve_app_target_for_path(path);
+        }
     }
 
     // 清空上一次的检查（路径、结果、句柄、列表）
@@ -182,16 +319,14 @@ namespace gui::detail
     {
         ui().paths.clear();
         ui().app_targets.clear();
-        ui().results.clear();
-        ui().handles.clear();
-        ui().handles_query_ok = true;
         ui().search_pending = false;   // 排队中的旧扫描没意义了
+        invalidate_result_model();
+        update_button_states();
+        update_menu_state();
         if (ui().list != nullptr)
         {
-            ListView_DeleteAllItems(ui().list);
+            InvalidateRect(ui().list, nullptr, TRUE);
         }
-        update_button_states();
-        InvalidateRect(ui().list, nullptr, TRUE);
     }
 
     void add_app_target(const std::wstring& target)
@@ -214,6 +349,11 @@ namespace gui::detail
     std::vector<int> selected_rows()
     {
         std::vector<int> rows;
+        if (ui().list == nullptr)
+        {
+            return rows;
+        }
+
         int row = -1;
         while ((row = ListView_GetNextItem(ui().list, row, LVNI_SELECTED)) != -1)
         {

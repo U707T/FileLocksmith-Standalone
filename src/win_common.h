@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cwchar>
+#include <cstdint>
 #include <atomic>
 #include <filesystem>
 #include <fstream>

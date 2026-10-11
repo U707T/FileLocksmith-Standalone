@@ -87,11 +87,15 @@ namespace gui::detail
         LocksmithResult locks;
         std::wstring error;
         std::wstring app_note;   // 快捷方式展开的说明
-        unsigned generation = 0; // 发起这次扫描时的代号
+        uint64_t job_id = 0;      // 这次后台任务的唯一代号
+        uint64_t input_generation = 0; // 任务开始时的路径模型版本
     };
     constexpr UINT kDpiChangedMessage = 0x02E0;
     // replace=true（拖放/打开方式的默认语义）：这是新的一次检查，先清空上一次的路径与结果
     void add_paths(const std::vector<std::wstring>& new_paths, bool replace);
+    // 首次启动也必须走同一套 .lnk/.exe 路径预处理，但此函数不启动线程、不依赖窗口控件。
+    void initialize_paths(const std::vector<std::wstring>& paths);
+    void rebuild_app_targets();
     void clear_current_check();
 
     // 界面状态（原来散在匿名命名空间里的全局变量）
@@ -112,6 +116,7 @@ namespace gui::detail
         HFONT headline_font = nullptr;
         HICON header_icon_handle = nullptr;
         HMENU main_menu = nullptr;
+        HMENU file_menu = nullptr;
         HMENU tools_menu = nullptr;
         UINT dpi = 96;
         HIMAGELIST icons = nullptr;
@@ -119,17 +124,23 @@ namespace gui::detail
         ui_state::WindowState saved_state;
         bool columns_restored = false;
         DWORD busy_started = 0;
-        bool searching = false;
-        bool search_pending = false;
-        // 每次重新检查自增：旧扫描的结果回来时用它判断是否已经过期（用户又拖了新文件）
-        unsigned search_generation = 0;
-        std::atomic<bool> worker_running { false };
+        bool searching = false;       // 当前结果是否处于扫描中的 UI 状态
+        bool search_pending = false;  // 当前 worker 收尾后要不要带着最新路径再查
+        uint64_t input_generation = 0; // paths/app_targets 的版本
+        uint64_t next_job_id = 0;
+        uint64_t active_job_id = 0;
+        bool result_valid = false;    // results/handles 是否对应当前 input_generation
+        bool closing = false;
+        std::atomic<bool> worker_running { false };   // worker 或其完成消息尚未被主线程消费
+        std::thread worker;
         std::atomic<HWND> post_target { nullptr };
+        std::atomic<SearchPayload*> completion_fallback { nullptr };
         std::vector<std::wstring> paths;
         std::vector<ProcessResult> results;
         std::vector<LockedHandle> handles;
         std::vector<std::wstring> app_targets;
-        bool handles_query_ok = true;
+        bool handles_query_ok = false;
+        bool processes_query_ok = false;
     };
 
     inline UiState& ui()
@@ -142,7 +153,6 @@ namespace gui::detail
     void add_app_target(const std::wstring& target);
     void add_files_via_dialog(bool replace);
     void add_folder_via_dialog(bool replace);
-    void add_paths(const std::vector<std::wstring>& new_paths);
     void add_sendto_menu();
     void apply_ui_font();
     // 按窗口 DPI 缩放布局常量（字体早就按 DPI 建了，布局此前是固定像素）
@@ -198,6 +208,10 @@ namespace gui::detail
     void show_about();
     void show_list_menu();
     void start_search();
+    bool is_search_busy();
+    bool ensure_result_action(const wchar_t* action);
+    bool ensure_path_action(const wchar_t* action);
+    void handle_search_done(SearchPayload* payload);
     void toggle_context_menu();
     void update_button_states();
     void update_menu_state();

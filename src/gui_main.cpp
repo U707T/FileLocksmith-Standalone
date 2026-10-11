@@ -44,6 +44,113 @@ namespace gui::detail
         return SendMessageW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data)) != 0;
     }
 
+    void handle_search_done(SearchPayload* raw_payload)
+    {
+        std::unique_ptr<SearchPayload> payload(raw_payload);
+        if (payload == nullptr || payload->job_id != ui().active_job_id)
+        {
+            return;
+        }
+
+        // worker 在投递完成消息后仍然是 joinable；在主线程消费 payload 时回收它，
+        // 不让后台线程跨越窗口/CRT 的生命周期。
+        if (ui().worker.joinable())
+        {
+            ui().worker.join();
+        }
+        ui().worker_running.store(false);
+        KillTimer(ui().window, BUSY_TIMER_ID);
+        set_busy(false);
+
+        const bool current_input = payload->input_generation == ui().input_generation;
+        if (!current_input)
+        {
+            // 路径模型已经变了：旧任务的结果一律作废，不能把旧文件的结果留在列表里。
+            ui().results.clear();
+            ui().handles.clear();
+            ui().handles_query_ok = false;
+            ui().processes_query_ok = false;
+            ui().result_valid = false;
+            fill_list();
+
+            if (ui().search_pending)
+            {
+                ui().search_pending = false;
+                start_search();
+            }
+            return;
+        }
+
+        const bool query_ok = payload->error.empty() &&
+                              payload->locks.handles_query_ok &&
+                              payload->locks.processes_query_ok;
+        if (!query_ok)
+        {
+            // 异常或任一查询阶段失败时，清掉旧结果和旧句柄。旧句柄值不能继续用于
+            // 强制解锁，否则 PID/句柄复用后可能操作到错误资源。
+            ui().results.clear();
+            ui().handles.clear();
+            ui().handles_query_ok = payload->locks.handles_query_ok;
+            ui().processes_query_ok = payload->locks.processes_query_ok;
+            ui().result_valid = false;
+            fill_list();
+
+            if (!payload->error.empty())
+            {
+                set_status(payload->error);
+            }
+            else if (!payload->locks.handles_query_ok)
+            {
+                set_status(L"句柄枚举失败：结果不可信，请在「工具」菜单里选「以管理员身份重启」后重试。");
+            }
+            else
+            {
+                set_status(L"进程枚举失败：结果不完整，请重新检查或在「工具」菜单里选「以管理员身份重启」。");
+            }
+        }
+        else
+        {
+            ui().results = payload->locks.processes;
+            ui().handles = payload->locks.handles;
+            ui().handles_query_ok = true;
+            ui().processes_query_ok = true;
+            ui().result_valid = true;
+            fill_list();
+
+            const auto unresolved = payload->locks.unresolved_paths.size();
+            if (ui().results.empty())
+            {
+                set_status(unresolved == 0
+                               ? L"没有进程正在占用这些文件。"
+                               : L"没有进程占用 —— 但有 " + std::to_wstring(unresolved) + L" 个路径打不开（不存在或没权限），实际没有被检查。");
+            }
+            else
+            {
+                std::wstring text = L"找到 " + std::to_wstring(ui().results.size()) + L" 个进程正在占用" +
+                                    L"（可强制关闭的文件句柄 " + std::to_wstring(ui().handles.size()) + L" 个）";
+                if (!payload->app_note.empty())
+                {
+                    text += L"；" + payload->app_note;
+                }
+                if (unresolved > 0)
+                {
+                    text += L"；另有 " + std::to_wstring(unresolved) + L" 个路径打不开，已跳过";
+                }
+                if (!app::is_process_elevated())
+                {
+                    text += L"，系统进程可能因权限不足而看不到";
+                }
+                set_status(text);
+            }
+        }
+
+        if (ui().search_pending)
+        {
+            ui().search_pending = false;
+            start_search();
+        }
+    }
+
     LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
     {
         switch (message)
@@ -321,15 +428,23 @@ namespace gui::detail
             break;
 
         case WM_TIMER:
-            if (w_param == BUSY_TIMER_ID && ui().searching)
+            if (w_param == BUSY_TIMER_ID)
             {
-                const auto elapsed = (GetTickCount() - ui().busy_started) / 1000;
-                if (elapsed >= 1)
+                if (SearchPayload* fallback = ui().completion_fallback.exchange(nullptr))
                 {
-                    set_status(L"正在扫描系统句柄…已 " + std::to_wstring(elapsed) + L" 秒"
-                               L"（进程多、模块多的时候会久一点）");
+                    handle_search_done(fallback);
+                    return 0;
                 }
-                return 0;
+                if (ui().searching)
+                {
+                    const auto elapsed = (GetTickCount() - ui().busy_started) / 1000;
+                    if (elapsed >= 1)
+                    {
+                        set_status(L"正在扫描系统句柄…已 " + std::to_wstring(elapsed) + L" 秒"
+                                   L"（进程多、模块多的时候会久一点）");
+                    }
+                    return 0;
+                }
             }
             break;
 
@@ -380,82 +495,14 @@ namespace gui::detail
         }
 
         case WM_FL_SEARCH_DONE:
-        {
-            std::unique_ptr<SearchPayload> payload(reinterpret_cast<SearchPayload*>(l_param));
-
-            // 用户在这轮扫描跑完之前又拖了新文件：这次结果已经过期，直接丢掉，
-            // 不能让它盖掉新一轮的结果（否则界面会先显示旧文件的内容）
-            if (payload->generation != ui().search_generation)
-            {
-                // 这一轮 worker 已经结束：先把界面从"正在扫描"状态收回来，
-                // 否则 searching 一直为真，新扫描永远起不来（界面看起来就是"拖不进去"）
-                KillTimer(ui().window, BUSY_TIMER_ID);
-                set_busy(false);
-
-                if (ui().search_pending)
-                {
-                    ui().search_pending = false;
-                    start_search();
-                }
-                return 0;
-            }
-
-            KillTimer(ui().window, BUSY_TIMER_ID);
-            set_busy(false);
-
-            if (!payload->error.empty())
-            {
-                set_status(payload->error);
-            }
-            else
-            {
-                ui().results = payload->locks.processes;
-                ui().handles = payload->locks.handles;
-                ui().handles_query_ok = payload->locks.handles_query_ok;
-                fill_list();
-
-                const auto unresolved = payload->locks.unresolved_paths.size();
-                if (!ui().handles_query_ok)
-                {
-                    set_status(L"句柄枚举失败：结果不可信，请在「工具」菜单里选「以管理员身份重启」后重试。");
-                }
-                else if (ui().results.empty())
-                {
-                    set_status(unresolved == 0
-                                   ? L"没有进程正在占用这些文件。"
-                                   : L"没有进程占用 —— 但有 " + std::to_wstring(unresolved) + L" 个路径打不开（不存在或没权限），实际没有被检查。");
-                }
-                else
-                {
-                    std::wstring text = L"找到 " + std::to_wstring(ui().results.size()) + L" 个进程正在占用" +
-                                        L"（可强制关闭的文件句柄 " + std::to_wstring(ui().handles.size()) + L" 个）";
-                    if (!payload->app_note.empty())
-                    {
-                        text += L"；" + payload->app_note;
-                    }
-                    if (unresolved > 0)
-                    {
-                        text += L"；另有 " + std::to_wstring(unresolved) + L" 个路径打不开，已跳过";
-                    }
-                    if (!app::is_process_elevated())
-                    {
-                        text += L"，系统进程可能因权限不足而看不到";
-                    }
-                    set_status(text);
-                }
-            }
-
-            if (ui().search_pending)
-            {
-                ui().search_pending = false;
-                start_search();
-            }
+            handle_search_done(reinterpret_cast<SearchPayload*>(l_param));
             return 0;
-        }
 
         case WM_CLOSE:
         {
             // 记住窗口位置/大小与列宽（同类工具都会记）
+            ui().closing = true;
+            ui().post_target.store(nullptr);
             ui_state::WindowState state;
             WINDOWPLACEMENT placement{};
             placement.length = sizeof(placement);
@@ -519,7 +566,9 @@ namespace gui
         using namespace detail;
 
         ui().instance = GetModuleHandleW(nullptr);
-        ui().paths = paths;
+        ui().closing = false;
+        ui().search_pending = false;
+        initialize_paths(paths);
 
         // Multi-select from the shell starts one process per file: hand the paths
         // over to the instance that is already running instead of opening a pile
@@ -623,10 +672,14 @@ namespace gui
             DestroyAcceleratorTable(accelerator_table);
         }
 
-        // 等后台枚举线程收尾（最多 2 秒），别在线程还卡在系统调用里的时候拆 CRT
-        for (int i = 0; i < 40 && ui().worker_running.load(); ++i)
+        // 窗口已经关闭后回收后台线程，避免 detached worker 访问正在析构的 CRT/UI 状态。
+        if (ui().worker.joinable())
         {
-            Sleep(50);
+            ui().worker.join();
+        }
+        if (SearchPayload* fallback = ui().completion_fallback.exchange(nullptr))
+        {
+            delete fallback;
         }
         return 0;
     }

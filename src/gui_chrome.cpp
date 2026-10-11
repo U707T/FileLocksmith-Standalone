@@ -302,7 +302,7 @@ namespace gui::detail
             // 不用额外的 STATIC 控件：那种"浮在上面的兄弟窗口"会被 z-order / 重绘
             // 折腾得时有时无（2.3.0 就丢过一次），画在这里是确定性的。
             const LRESULT result = DefSubclassProc(hwnd, message, w_param, l_param);
-            if (ui().results.empty() && !ui().searching)
+            if (ui().results.empty() && !ui().searching && (ui().paths.empty() || ui().result_valid))
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
@@ -763,24 +763,33 @@ namespace gui::detail
 
     void update_button_states()
     {
-        const bool busy = ui().searching;
+        const bool busy = is_search_busy();
+        const bool ready = ui().result_valid && ui().handles_query_ok && ui().processes_query_ok;
         const bool has_selection = !selected_rows().empty();
 
-        EnableWindow(button_by_id(IDC_KILL_SELECTED), !busy && has_selection);
-        EnableWindow(button_by_id(IDC_KILL_ALL), !busy && !ui().results.empty());
-        // 只有真的存在可关闭的文件句柄才让点"强制解锁"（纯模块映射点了什么也做不了）
-        EnableWindow(button_by_id(IDC_FORCE_UNLOCK), !busy && !ui().handles.empty());
+        EnableWindow(button_by_id(IDC_KILL_SELECTED), !busy && ready && has_selection);
+        EnableWindow(button_by_id(IDC_KILL_ALL), !busy && ready && !ui().results.empty());
+        // 只有当前查询完整成功且真的存在可关闭的文件句柄才让点"强制解锁"。
+        EnableWindow(button_by_id(IDC_FORCE_UNLOCK), !busy && ready && !ui().handles.empty());
         EnableWindow(button_by_id(IDC_DELETE_FILES), !busy && !ui().paths.empty());
         EnableWindow(button_by_id(IDC_REFRESH), !busy);
-        EnableWindow(button_by_id(IDC_OPEN_LOCATION), !busy && has_selection);
+        EnableWindow(button_by_id(IDC_OPEN_LOCATION), !busy && ready && has_selection);
     }
 
     void update_menu_state()
     {
+        const bool busy = is_search_busy();
+        if (ui().file_menu != nullptr)
+        {
+            EnableMenuItem(ui().file_menu, IDM_DELETE_FILES,
+                           MF_BYCOMMAND | ((!busy && !ui().paths.empty()) ? MF_ENABLED : MF_GRAYED));
+        }
         if (ui().tools_menu == nullptr)
         {
             return;
         }
+        EnableMenuItem(ui().tools_menu, IDM_REFRESH,
+                       MF_BYCOMMAND | (busy ? MF_GRAYED : MF_ENABLED));
         // 勾选状态每次弹出菜单时重新读注册表（可能在外部被改动）。
         // 这里用的是 build_menu 存下来的子菜单句柄，不依赖"第几个子菜单"这种下标约定。
         CheckMenuItem(ui().tools_menu, IDM_TOGGLE_CONTEXT_MENU,
@@ -824,6 +833,7 @@ namespace gui::detail
 
         SetMenu(hwnd, menu);
         ui().main_menu = menu;
+        ui().file_menu = file_menu;
         ui().tools_menu = tools_menu;
         update_menu_state();
     }

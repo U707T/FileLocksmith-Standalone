@@ -4,6 +4,11 @@ namespace gui::detail
 {
     void kill_selected()
     {
+        if (!ensure_result_action(L"结束进程"))
+        {
+            return;
+        }
+
         const auto rows = selected_rows();
         if (rows.empty())
         {
@@ -55,6 +60,11 @@ namespace gui::detail
 
     void kill_all()
     {
+        if (!ensure_result_action(L"结束全部进程"))
+        {
+            return;
+        }
+
         if (ui().results.empty())
         {
             return;
@@ -89,6 +99,11 @@ namespace gui::detail
 
     void force_unlock()
     {
+        if (!ensure_result_action(L"强制解锁"))
+        {
+            return;
+        }
+
         // 选中了进程就只关这些进程的句柄，没选才动全部（多选之后必须区分，否则会误伤）
         std::vector<LockedHandle> targets;
         const auto rows = selected_rows();
@@ -162,11 +177,12 @@ namespace gui::detail
         }
 
         const size_t deleted = ui().paths.size() - remaining.size();
-        ui().paths = remaining;
-        if (ui().paths.empty())
+        if (remaining != ui().paths)
         {
-            ui().app_targets.clear();
+            ++ui().input_generation;
         }
+        ui().paths = remaining;
+        rebuild_app_targets();
 
         if (deleted > 0)
         {
@@ -179,7 +195,11 @@ namespace gui::detail
         {
             ui().results.clear();
             ui().handles.clear();
+            ui().handles_query_ok = false;
+            ui().processes_query_ok = false;
+            ui().result_valid = false;
             fill_list();
+            update_menu_state();
         }
         else
         {
@@ -288,9 +308,8 @@ namespace gui::detail
 
     void delete_checked_paths()
     {
-        if (ui().paths.empty())
+        if (!ensure_path_action(L"删除检查的文件"))
         {
-            set_status(L"没有要删除的路径。");
             return;
         }
 
@@ -312,6 +331,11 @@ namespace gui::detail
 
     void open_file_location()
     {
+        if (!ensure_result_action(L"打开所在位置"))
+        {
+            return;
+        }
+
         // 多选时按顺序打开每一个（资源管理器会自己并成窗口）
         const auto rows = selected_rows();
         bool opened = false;
@@ -336,6 +360,11 @@ namespace gui::detail
 
     void copy_selected(bool exe_path, bool pid_only, bool whole_row)
     {
+        if (!ensure_result_action(L"复制结果"))
+        {
+            return;
+        }
+
         const auto rows = selected_rows();
         std::wstring text;
         for (int row : rows)
@@ -404,6 +433,8 @@ namespace gui::detail
     void show_list_menu()
     {
         const bool has_selection = !selected_rows().empty();
+        const bool result_actions_enabled = !is_search_busy() && ui().result_valid &&
+                                            ui().handles_query_ok && ui().processes_query_ok;
 
         HMENU menu = CreatePopupMenu();
         if (menu == nullptr)
@@ -411,7 +442,7 @@ namespace gui::detail
             return;
         }
 
-        const UINT state = has_selection ? MF_ENABLED : MF_GRAYED;
+        const UINT state = (result_actions_enabled && has_selection) ? MF_ENABLED : MF_GRAYED;
         AppendMenuW(menu, MF_STRING | state, IDM_LIST_KILL, L"结束选中的进程(&K)");
         AppendMenuW(menu, MF_STRING | state, IDM_LIST_LOCATE, L"打开所在位置(&L)");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
